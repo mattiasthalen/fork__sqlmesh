@@ -25,6 +25,7 @@ class CsvSettings(PydanticModel):
     skipinitialspace: t.Optional[bool] = None
     lineterminator: t.Optional[str] = None
     encoding: t.Optional[str] = None
+    dtype: t.Optional[str] = None
 
     @field_validator("doublequote", "skipinitialspace", mode="before")
     @classmethod
@@ -34,7 +35,7 @@ class CsvSettings(PydanticModel):
         return parse_bool(v)
 
     @field_validator(
-        "delimiter", "quotechar", "escapechar", "lineterminator", "encoding", mode="before"
+        "delimiter", "quotechar", "escapechar", "lineterminator", "encoding", "dtype", mode="before"
     )
     @classmethod
     def _str_validator(cls, v: t.Any) -> t.Optional[str]:
