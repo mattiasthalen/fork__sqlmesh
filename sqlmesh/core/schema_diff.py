@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import typing as t
-from collections import defaultdict
 from enum import Enum, auto
+from collections import defaultdict
+from pydantic import Field
 from sqlglot import exp
 from sqlglot.helper import ensure_list, seq_get
 
@@ -168,6 +169,7 @@ class TableAlterOperation(PydanticModel):
     expected_table_struct: exp.DataType
     add_position: t.Optional[TableAlterColumnPosition] = None
     current_type: t.Optional[exp.DataType] = None
+    cascade: bool = False
 
     @classmethod
     def add(
@@ -191,6 +193,7 @@ class TableAlterOperation(PydanticModel):
         columns: t.Union[TableAlterColumn, t.List[TableAlterColumn]],
         expected_table_struct: t.Union[str, exp.DataType],
         column_type: t.Optional[t.Union[str, exp.DataType]] = None,
+        cascade: bool = False,
     ) -> TableAlterOperation:
         column_type = exp.DataType.build(column_type) if column_type else exp.DataType.build("INT")
         return cls(
@@ -198,6 +201,7 @@ class TableAlterOperation(PydanticModel):
             columns=ensure_list(columns),
             column_type=column_type,
             expected_table_struct=exp.DataType.build(expected_table_struct),
+            cascade=cascade,
         )
 
     @classmethod
@@ -273,7 +277,9 @@ class TableAlterOperation(PydanticModel):
             return alter_table
         elif self.is_drop:
             alter_table = exp.Alter(this=exp.to_table(table_name), kind="TABLE")
-            drop_column = exp.Drop(this=self.column(array_element_selector), kind="COLUMN")
+            drop_column = exp.Drop(
+                this=self.column(array_element_selector), kind="COLUMN", cascade=self.cascade
+            )
             alter_table.set("actions", [drop_column])
             return alter_table
         else:
@@ -305,8 +311,14 @@ class SchemaDiffer(PydanticModel):
             columns of nested STRUCTs.
         compatible_types: Types that are compatible and automatically coerced in actions like UNION ALL. Dict key is data
             type, and value is the set of types that are compatible with it.
+        coerceable_types: The mapping from a current type to all types that can be safely coerced to the current one without
+            altering the column type. NOTE: usually callers should not specify this attribute manually and set the
+            `support_coercing_compatible_types` flag instead. Some engines are inconsistent about their type coercion rules.
+            For example, in BigQuery a BIGNUMERIC column can't be altered to be FLOAT64, while BIGNUMERIC values can be inserted
+            into a FLOAT64 column just fine.
         support_coercing_compatible_types: Whether or not the engine for which the diff is being computed supports direct
             coercion of compatible types.
+        drop_cascade: Whether to add CASCADE modifier when dropping a column.
         parameterized_type_defaults: Default values for parameterized data types. Dict key is a sqlglot exp.DataType.Type,
             but in the engine adapter specification we build it from the dialect string instead of specifying it directly.
             Example: `exp.DataType.build("STRING", dialect=DIALECT).this` instead of the underlying `exp.DataType.Type.TEXT`
@@ -326,7 +338,11 @@ class SchemaDiffer(PydanticModel):
     support_nested_drop: bool = False
     array_element_selector: str = ""
     compatible_types: t.Dict[exp.DataType, t.Set[exp.DataType]] = {}
+    coerceable_types_: t.Dict[exp.DataType, t.Set[exp.DataType]] = Field(
+        default_factory=dict, alias="coerceable_types"
+    )
     support_coercing_compatible_types: bool = False
+    drop_cascade: bool = False
     parameterized_type_defaults: t.Dict[
         exp.DataType.Type, t.List[t.Tuple[t.Union[int, float], ...]]
     ] = {}
@@ -339,8 +355,9 @@ class SchemaDiffer(PydanticModel):
     def coerceable_types(self) -> t.Dict[exp.DataType, t.Set[exp.DataType]]:
         if not self._coerceable_types:
             if not self.support_coercing_compatible_types or not self.compatible_types:
-                return {}
-            coerceable_types = defaultdict(set)
+                return self.coerceable_types_
+            coerceable_types: t.Dict[exp.DataType, t.Set[exp.DataType]] = defaultdict(set)
+            coerceable_types.update(self.coerceable_types_)
             for source_type, target_types in self.compatible_types.items():
                 for target_type in target_types:
                     coerceable_types[target_type].add(source_type)
@@ -361,14 +378,15 @@ class SchemaDiffer(PydanticModel):
         return False
 
     def _is_coerceable_type(self, current_type: exp.DataType, new_type: exp.DataType) -> bool:
-        if not self.support_coercing_compatible_types:
-            return False
         if current_type in self.coerceable_types:
             is_coerceable = new_type in self.coerceable_types[current_type]
             if is_coerceable:
-                logger.warning(
-                    f"Coercing type {current_type} to {new_type} which means an alter will not be performed and therefore the resulting table structure will not match what is in the query.\nUpdate your model to cast the value to {current_type} type in order to remove this warning.",
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"Coercing type {current_type} to {new_type} which means an alter will not be performed and therefore the resulting table structure will not match what is in the query.\nUpdate your model to cast the value to {current_type} type in order to remove this warning."
                 )
+
             return is_coerceable
         return False
 
@@ -450,7 +468,9 @@ class SchemaDiffer(PydanticModel):
         assert column_kwarg
         struct.expressions.pop(column_pos)
         operations.append(
-            TableAlterOperation.drop(columns, root_struct.copy(), column_kwarg.args["kind"])
+            TableAlterOperation.drop(
+                columns, root_struct.copy(), column_kwarg.args["kind"], cascade=self.drop_cascade
+            )
         )
         return operations
 
@@ -685,6 +705,16 @@ def has_drop_alteration(alter_expressions: t.List[exp.Alter]) -> bool:
         for actions in alter_expressions
         for action in actions.args.get("actions", [])
     )
+
+
+def get_dropped_column_names(alter_expressions: t.List[exp.Alter]) -> t.List[str]:
+    dropped_columns = []
+    for actions in alter_expressions:
+        for action in actions.args.get("actions", []):
+            if isinstance(action, exp.Drop):
+                if action.kind == "COLUMN":
+                    dropped_columns.append(action.alias_or_name)
+    return dropped_columns
 
 
 def _get_name_and_type(struct: exp.ColumnDef) -> t.Tuple[exp.Identifier, exp.DataType]:

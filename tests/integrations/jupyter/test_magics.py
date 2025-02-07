@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from bs4 import BeautifulSoup
-from freezegun import freeze_time
+import time_machine
 from hyperscript import h
 from IPython.core.error import UsageError
 from IPython.testing.globalipapp import start_ipython
@@ -23,7 +23,7 @@ SUSHI_EXAMPLE_PATH = pathlib.Path("./examples/sushi")
 SUCCESS_STYLE = "color: #008000; text-decoration-color: #008000"
 NEUTRAL_STYLE = "color: #008080; text-decoration-color: #008080"
 RICH_PRE_STYLE = "white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace"
-FREEZE_TIME = "2023-01-01 00:00:00"
+FREEZE_TIME = "2023-01-01 00:00:00 UTC"
 
 pytestmark = pytest.mark.jupyter
 
@@ -55,7 +55,7 @@ def sushi_context(copy_to_temp_path, notebook, tmp_path) -> Context:
 
 
 @pytest.fixture
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def loaded_sushi_context(sushi_context) -> Context:
     with capture_output():
         sushi_context.plan(no_prompts=True, auto_apply=True)
@@ -77,9 +77,9 @@ def convert_all_html_output_to_tags():
     def _convert_html_to_tags(html: str) -> t.List[str]:
         # BS4 automatically adds html and body tags so we remove those since they are not actually part of the output
         return [
-            tag.name
+            tag.name  # type: ignore
             for tag in BeautifulSoup(html, "html").find_all()
-            if tag.name not in {"html", "body"}
+            if tag.name not in {"html", "body"}  # type: ignore
         ]
 
     def _convert(output: CapturedIO) -> t.List[t.List[str]]:
@@ -183,7 +183,7 @@ def test_render_no_format(
 
 
 @pytest.mark.slow
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_evaluate(notebook, loaded_sushi_context):
     with capture_output() as output:
         notebook.run_line_magic(magic_name="evaluate", line="sushi.top_waiters")
@@ -237,7 +237,7 @@ def test_diff(sushi_context, notebook, convert_all_html_output_to_text, get_all_
     assert not output.stderr
     assert len(output.outputs) == 2
     assert convert_all_html_output_to_text(output) == [
-        "Summary of differences against `prod`:",
+        "Differences from the `prod` environment:",
         "Models:\n└── Directly Modified:\n    └── sqlmesh_example.test",
     ]
     assert get_all_html_output(output) == [
@@ -248,7 +248,7 @@ def test_diff(sushi_context, notebook, convert_all_html_output_to_text, get_all_
                 h(
                     "span",
                     {"style": "font-weight: bold"},
-                    "Summary of differences against `prod`:",
+                    "Differences from the `prod` environment:",
                     autoescape=False,
                 ),
                 autoescape=False,
@@ -291,7 +291,7 @@ def test_plan(
 
     # TODO: Should this be going to stdout? This is printing the status updates for when each batch finishes for
     # the models and how long it took
-    assert len(output.stdout.strip().split("\n")) == 22
+    assert len(output.stdout.strip().split("\n")) == 23
     assert not output.stderr
     assert len(output.outputs) == 4
     text_output = convert_all_html_output_to_text(output)
@@ -303,7 +303,7 @@ def test_plan(
     )
     # TODO: Is this what we expect?
     assert text_output[2] == ""
-    assert text_output[3] == "The target environment has been updated successfully"
+    assert text_output[3] == "Target environment updated successfully"
     assert convert_all_html_output_to_tags(output) == [
         ["pre", "span"],
         ["pre"] + ["span"] * 4,
@@ -313,7 +313,7 @@ def test_plan(
 
 
 @pytest.mark.slow
-@freeze_time("2023-01-03 00:00:00")
+@time_machine.travel("2023-01-03 00:00:00 UTC")
 def test_run_dag(
     notebook, loaded_sushi_context, convert_all_html_output_to_text, get_all_html_output
 ):
@@ -326,7 +326,7 @@ def test_run_dag(
     assert not output.stderr
     assert len(output.outputs) == 2
     assert convert_all_html_output_to_text(output) == [
-        "All model batches have been executed successfully",
+        "Model batches executed successfully",
         "Run finished for environment 'prod'",
     ]
     assert get_all_html_output(output) == [
@@ -337,7 +337,7 @@ def test_run_dag(
                 h(
                     "span",
                     {"style": SUCCESS_STYLE},
-                    "All model batches have been executed successfully",
+                    "Model batches executed successfully",
                     autoescape=False,
                 ),
                 autoescape=False,
@@ -366,7 +366,7 @@ def test_run_dag(
 
 
 @pytest.mark.slow
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_invalidate(
     notebook, loaded_sushi_context, convert_all_html_output_to_text, get_all_html_output
 ):
@@ -381,7 +381,7 @@ def test_invalidate(
     assert not output.stderr
     assert len(output.outputs) == 1
     assert convert_all_html_output_to_text(output) == [
-        "Environment 'dev' has been invalidated.",
+        "Environment 'dev' invalidated.",
     ]
     assert get_all_html_output(output) == [
         str(
@@ -408,7 +408,7 @@ def test_invalidate(
                     h(
                         "span",
                         {"style": SUCCESS_STYLE},
-                        " has been invalidated.",
+                        " invalidated.",
                         autoescape=False,
                     )
                 ),
@@ -468,9 +468,9 @@ def test_create_test(notebook, sushi_context):
     assert (
         test_file.read_text()
         == """test_top_waiters:
-  model: sushi.top_waiters
+  model: '"memory"."sushi"."top_waiters"'
   inputs:
-    sushi.waiter_revenue_by_day:
+    '"memory"."sushi"."waiter_revenue_by_day"':
     - waiter_id: 1
   outputs:
     query: []
@@ -543,66 +543,26 @@ def test_fetchdf(notebook, sushi_context):
 
 def test_info(notebook, sushi_context, convert_all_html_output_to_text, get_all_html_output):
     with capture_output() as output:
-        notebook.run_line_magic(magic_name="info", line="")
+        notebook.run_line_magic(magic_name="info", line="--verbose")
 
     assert not output.stdout
     assert not output.stderr
-    assert len(output.outputs) == 3
+    assert len(output.outputs) == 6
     assert convert_all_html_output_to_text(output) == [
         "Models: 17",
-        "Macros: 6",
+        "Macros: 7",
+        "",
+        "Connection:\n  type: duckdb\n  concurrent_tasks: 1\n  register_comments: true\n  pre_ping: false\n  pretty_sql: false\n  extensions: []\n  connector_config: {}",
+        "Test Connection:\n  type: duckdb\n  concurrent_tasks: 1\n  register_comments: true\n  pre_ping: false\n  pretty_sql: false\n  extensions: []\n  connector_config: {}",
         "Data warehouse connection succeeded",
     ]
     assert get_all_html_output(output) == [
-        str(
-            h(
-                "pre",
-                {"style": RICH_PRE_STYLE},
-                "Models: "
-                + str(
-                    h(
-                        "span",
-                        # "color: #008000; text-decoration-color: #008000"
-                        {"style": f"{NEUTRAL_STYLE}; font-weight: bold"},
-                        "17",
-                        autoescape=False,
-                    )
-                ),
-                autoescape=False,
-            )
-        ),
-        str(
-            h(
-                "pre",
-                {"style": RICH_PRE_STYLE},
-                "Macros: "
-                + str(
-                    h(
-                        "span",
-                        {"style": f"{NEUTRAL_STYLE}; font-weight: bold"},
-                        "6",
-                        autoescape=False,
-                    )
-                ),
-                autoescape=False,
-            )
-        ),
-        str(
-            h(
-                "pre",
-                {"style": RICH_PRE_STYLE},
-                "Data warehouse connection "
-                + str(
-                    h(
-                        "span",
-                        {"style": SUCCESS_STYLE},
-                        "succeeded",
-                        autoescape=False,
-                    )
-                ),
-                autoescape=False,
-            )
-        ),
+        "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\">Models: <span style=\"color: #008080; text-decoration-color: #008080; font-weight: bold\">17</span></pre>",
+        "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\">Macros: <span style=\"color: #008080; text-decoration-color: #008080; font-weight: bold\">7</span></pre>",
+        "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"></pre>",
+        '<pre style="white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,\'DejaVu Sans Mono\',consolas,\'Courier New\',monospace">Connection:  type: duckdb  concurrent_tasks: <span style="color: #008080; text-decoration-color: #008080; font-weight: bold">1</span>  register_comments: true  pre_ping: false  pretty_sql: false  extensions: <span style="font-weight: bold">[]</span>  connector_config: <span style="font-weight: bold">{}</span></pre>',
+        '<pre style="white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,\'DejaVu Sans Mono\',consolas,\'Courier New\',monospace">Test Connection:  type: duckdb  concurrent_tasks: <span style="color: #008080; text-decoration-color: #008080; font-weight: bold">1</span>  register_comments: true  pre_ping: false  pretty_sql: false  extensions: <span style="font-weight: bold">[]</span>  connector_config: <span style="font-weight: bold">{}</span></pre>',
+        "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\">Data warehouse connection <span style=\"color: #008000; text-decoration-color: #008000\">succeeded</span></pre>",
     ]
 
 
@@ -644,7 +604,7 @@ def test_migrate(
 
 
 @pytest.mark.slow
-def test_create_external_models(notebook, loaded_sushi_context):
+def test_create_external_models(notebook, loaded_sushi_context, convert_all_html_output_to_text):
     external_model_file = loaded_sushi_context.path / "external_models.yaml"
     external_model_file.unlink()
     assert not external_model_file.exists()
@@ -654,7 +614,11 @@ def test_create_external_models(notebook, loaded_sushi_context):
 
     assert not output.stdout
     assert not output.stderr
-    assert not output.outputs
+    assert len(output.outputs) == 2
+    converted = sorted(convert_all_html_output_to_text(output))
+    assert 'Unable to get schema for \'"memory"."raw"."model1"\'' in converted[0]
+    assert 'Unable to get schema for \'"memory"."raw"."model2"\'' in converted[1]
+
     assert external_model_file.exists()
     assert (
         external_model_file.read_text()
@@ -662,12 +626,13 @@ def test_create_external_models(notebook, loaded_sushi_context):
   columns:
     customer_id: INT
     zip: TEXT
+  gateway: duckdb
 """
     )
 
 
 @pytest.mark.slow
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_table_diff(notebook, loaded_sushi_context, convert_all_html_output_to_text):
     with capture_output():
         loaded_sushi_context.plan("dev", no_prompts=True, auto_apply=True, include_unmodified=True)
@@ -689,7 +654,7 @@ revenue      100.0""",
 
 
 @pytest.mark.slow
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_table_name(notebook, loaded_sushi_context, convert_all_html_output_to_text):
     with capture_output() as output:
         notebook.run_line_magic(magic_name="table_name", line="sushi.orders")

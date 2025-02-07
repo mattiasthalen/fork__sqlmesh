@@ -127,7 +127,7 @@ However, some model kinds are inherently non-idempotent:
 Those model kinds will behave as follows in a non-prod plan that specifies a limited date range:
 
 - If the `--start` option date is the same as or before the model's start date, the model is fully refreshed for all of time
-- If the `--start` option date is after the model's start date, the model is ignored by the plan and is not backfilled
+- If the `--start` option date is after the model's start date, only a preview is computed for this model which can't be reused when deploying to production
 
 #### Example
 
@@ -158,8 +158,8 @@ When we run the project's first plan, we see that SQLMesh correctly detected a d
 ======================================================================
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
-New environment `prod` will be created from `prod`
-Summary of differences against `prod`:
+`prod` environment will be initialized
+
 Models:
 └── Added:
     ├── sqlmesh_example.full_model
@@ -185,7 +185,9 @@ We then execute `sqlmesh plan dev` to create the new `dev` environment:
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
 New environment `dev` will be created from `prod`
-Summary of differences against `dev`:
+
+Differences from the `prod` environment:
+
 Models:
 ├── Directly Modified:
 │   ├── sqlmesh_example__dev.start_end_model
@@ -217,7 +219,7 @@ Let's cancel that plan and start a new one, passing a start date of 2024-09-24.
 
 The `start_end_model` is of kind `INCREMENTAL_BY_UNIQUE_KEY`, which is non-idempotent and cannot be backfilled for a limited time range.
 
-Because the command's `--start` of 2024-09-24 is after `start_end_model`'s start date 2024-09-23, `start_end_model` is ignored:
+Because the command's `--start` of 2024-09-24 is after `start_end_model`'s start date 2024-09-23, `start_end_model` is marked as preview:
 
 ``` bash linenums="1" hl_lines="12-13 20-21"
 ❯ sqlmesh plan dev --start 2024-09-24
@@ -225,30 +227,24 @@ Because the command's `--start` of 2024-09-24 is after `start_end_model`'s start
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
 New environment `dev` will be created from `prod`
-Summary of differences against `dev`:
+
+Differences from the `prod` environment:
+
 Models:
 ├── Directly Modified:
+│   ├── sqlmesh_example__dev.start_end_model
 │   └── sqlmesh_example__dev.incremental_model
-├── Indirectly Modified:
-│   └── sqlmesh_example__dev.full_model
-└── Ignored Models (Expected Plan Start):
-    └── sqlmesh_example__dev.start_end_model (2024-09-23 00:00:00+00:00)
+└── Indirectly Modified:
+    └── sqlmesh_example__dev.full_model
 
 [...model diff omitted...]
 
-Directly Modified: sqlmesh_example__dev.incremental_model (Non-breaking)
-└── Indirectly Modified Children:
-    └── sqlmesh_example__dev.full_model (Indirect Non-breaking)
+Directly Modified: sqlmesh_example__dev.start_end_model (Non-breaking)
 Models needing backfill (missing dates):
-└── sqlmesh_example__dev.incremental_model: 2024-09-24 - 2024-09-26
+├── sqlmesh_example__dev.incremental_model: 2024-09-24 - 2024-09-26
+└── sqlmesh_example__dev.start_end_model: 2024-09-24 - 2024-09-26 (preview)
 Enter the backfill end date (eg. '1 month ago', '2020-01-01') or blank to backfill up until '2024-09-27 00:00:00':
 ```
-
-The plan output contains a new `Ignored Models` entry telling us that `sqlmesh_example__dev.start_end_model` was ignored.
-
-It also displays the expected plan start date `2024-09-23`, which is the date our `--start` should include if we want the model to be included in the plan.
-
-Because it is ignored, `start_end_model` is not in the list of `Models needing backfill` at the bottom.
 
 ### Data preview for forward-only changes
 As mentioned earlier, the data output produced by [forward-only changes](#forward-only-change) in a development environment can only be used for preview and will not be reused in production.
@@ -318,15 +314,32 @@ This way SQLMesh will know to recompute data intervals starting from the specifi
 
 Models sometimes need to be re-evaluated for a given time range, even though the model definition has not changed.
 
-This could be due to an upstream issue with a dataset defined outside of SQLMesh, or when a [forward-only plan](#forward-only-plans) change needs to be applied retroactively to a bounded interval of historical data.
+For example, these scenarios all require re-evaluating model data that already exists:
 
-For this reason, the `plan` command supports the `--restate-model` selector, which allows specifying one or more model names or tags (using `tag:<tag name>` syntax) to be reprocessed. These can also refer to an external table defined outside SQLMesh.
+- Correcting an upstream data issue by reprocessing some of a model's existing data
+- Retroactively applying a [forward-only plan](#forward-only-plans) change to some historical data
+- Fully refreshing a model
 
-Applying a plan will trigger a cascading backfill for all specified models (other than external tables), as well as all models downstream from them. The plan's date range determines the data intervals that will be affected (learn more about the limitations of some model kinds [below](#model-kind-limitations)).
+In SQLMesh, reprocessing existing data is called a "restatement."
+
+Restate one or more models' data with the `plan` command's `--restate-model` selector. The [selector](../guides/model_selection.md) lets you specify which models to restate by name, wildcard, or tag (syntax [below](#restatement-examples)).
+
+!!! warning "No changes allowed"
+
+    Unlike regular plans, restatement plans ignore changes to local files. They can only restate the model versions already in the target environment.
+
+    You cannot restate a new model - it must already be present in the target environment. If it's not, add it first by running `sqlmesh plan` without the `--restate-model` option.
+
+Applying a restatement plan will trigger a cascading backfill for all selected models, as well as all models downstream from them. Models with restatement disabled will be skipped and not backfilled.
+
+You may restate external models. An [external model](./models/external_models.md) is just metadata about an external table, so the model does not actually reprocess anything. Instead, it triggers a cascading backfill of all downstream models.
+
+The plan's `--start` and `--end` date options determine which data intervals will be reprocessed. Some model kinds cannot be backfilled for limited date ranges, though - learn more [below](#model-kind-limitations).
 
 To prevent models from ever being restated, set the [disable_restatement](models/overview.md#disable_restatement) attribute to `true`.
 
-See examples below for how to restate both based on model names and model tags.
+<a name="restatement-examples"></a>
+These examples demonstrate how to select which models to restate based on model names or model tags.
 
 === "Names Only"
 
@@ -338,7 +351,7 @@ See examples below for how to restate both based on model names and model tags.
 
     ```bash
     # All selected models (including upstream models) will also include their downstream models
-    sqlmesh plan --restate-model "+db.model_a" --restate-model "tag:+expensive"
+    sqlmesh plan --restate-model "+db.model_a" --restate-model "+tag:expensive"
     ```
 
 === "Wildcards"
@@ -350,5 +363,53 @@ See examples below for how to restate both based on model names and model tags.
 === "Upstream + Wildcards"
 
     ```bash
-    sqlmesh plan --restate-model "+db*" --restate-model "tag:+exp*"
+    sqlmesh plan --restate-model "+db*" --restate-model "+tag:exp*"
     ```
+
+=== "Specific Date Range"
+
+    ```bash
+    sqlmesh plan --restate-model "db.model_a" --start "2024-01-01" --end "2024-01-10"
+    ```
+
+### Restating production vs development
+
+Restatement plans behave differently depending on if you're targeting the `prod` environment or a [development environment](./environments.md#how-to-use-environments).
+
+If you target a development environment like so:
+
+```bash
+sqlmesh plan dev --restate-model "db.model_a" --start "2024-01-01" --end "2024-01-10"
+```
+
+the restatement plan will restate the requested intervals for the specified model in the `dev` environment. Versions of the model in other environments will be unaffected.
+
+However, if you target the `prod` environment:
+
+```bash
+sqlmesh plan --restate-model "db.model_a" --start "2024-01-01" --end "2024-01-10"
+```
+
+the restatement plan will restate the intervals in the `prod` table *and clear the intervals from state for every other version of that model*.
+
+This means that next time you do a run in `dev`, those intervals will be restated in the development environment as well.
+
+The reason for this is to prevent old data from getting promoted to `prod`. One of the benefits of SQLMesh is being able to [reuse tables](#virtual-update) from development environments to ensure that production deployments consist of quick, painless pointer swaps.
+
+!!! info
+    If restating data in `prod` did not also trigger a restatement in `dev`, when `sqlmesh plan` is run against `prod` to deploy changes, a table containing old data may be promoted.
+
+This behavior also clears the affected intervals for downstream tables that only exist in development environments. Consider the following example:
+
+ - Table `A` exists in `prod`
+ - A virtual environment `dev` is created with new tables `B` and `C` downstream of `A`
+    - the DAG in `prod` looks like `A`
+    - the DAG in `dev` looks like `A <- B <- C`
+ - A restatement plan is created against table `A` in `prod`
+ - SQLMesh will ensure that the affected intervals are also cleared for `B` and `C` in `dev` even though those tables do not exist in `prod`
+
+!!! info "Bringing development environments up to date"
+
+    If a restatement plan against `prod` cleared intervals from state for tables in development environments, you need to `sqlmesh run <env>` to trigger the reprocessing of that data.
+
+    This is because SQLMesh limits the work done in the `prod` restatement plan to just the `prod` environment. That way the restatement can be applied as quickly as possible and avoid doing unnecessary work.

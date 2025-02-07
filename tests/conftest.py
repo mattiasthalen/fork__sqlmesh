@@ -19,9 +19,9 @@ from sqlglot.dialects.dialect import DialectType
 from sqlglot.helper import ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
-from sqlmesh.core.config import DuckDBConnectionConfig
+from sqlmesh.core.config import BaseDuckDBConnectionConfig
 from sqlmesh.core.context import Context
-from sqlmesh.core.engine_adapter import SparkEngineAdapter
+from sqlmesh.core.engine_adapter import MSSQLEngineAdapter, SparkEngineAdapter
 from sqlmesh.core.engine_adapter.base import EngineAdapter
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core import lineage
@@ -35,9 +35,11 @@ from sqlmesh.core.snapshot import (
     SnapshotChangeCategory,
     SnapshotDataVersion,
     SnapshotFingerprint,
+    DeployabilityIndex,
 )
 from sqlmesh.utils import random_id
 from sqlmesh.utils.date import TimeLike, to_date
+from sqlmesh.core.engine_adapter.shared import CatalogSupport
 
 pytest_plugins = ["tests.common_fixtures"]
 
@@ -114,12 +116,13 @@ class DuckDBMetadata:
 
 
 class SushiDataValidator:
-    def __init__(self, engine_adapter: EngineAdapter):
+    def __init__(self, engine_adapter: EngineAdapter, sushi_schema_name: str):
         self.engine_adapter = engine_adapter
+        self.sushi_schema_name = sushi_schema_name
 
     @classmethod
-    def from_context(cls, context: Context):
-        return cls(engine_adapter=context.engine_adapter)
+    def from_context(cls, context: Context, sushi_schema_name: str = "sushi"):
+        return cls(engine_adapter=context.engine_adapter, sushi_schema_name=sushi_schema_name)
 
     def validate(
         self,
@@ -154,9 +157,12 @@ class SushiDataValidator:
         """
         Both start and end are inclusive.
         """
-        if model_name == "sushi.customer_revenue_lifetime":
+        if model_name in (
+            f"{self.sushi_schema_name}.customer_revenue_lifetime",
+            "sushi.customer_revenue_lifetime",
+        ):
             env_name = f"__{env_name}" if env_name else ""
-            full_table_path = f"sushi{env_name}.customer_revenue_lifetime"
+            full_table_path = f"{self.sushi_schema_name}{env_name}.customer_revenue_lifetime"
             query = f"SELECT event_date, count(*) AS the_count FROM {full_table_path} group by event_date order by 2 desc, 1 desc"
             results = self.engine_adapter.fetchdf(
                 parse_one(query), quote_identifiers=True
@@ -213,7 +219,7 @@ def rescope_global_models(request):
 
 @pytest.fixture(scope="function", autouse=True)
 def rescope_duckdb_classvar(request):
-    DuckDBConnectionConfig._data_file_to_adapter = {}
+    BaseDuckDBConnectionConfig._data_file_to_adapter = {}
     yield
 
 
@@ -229,6 +235,13 @@ def rescope_lineage_cache(request):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_console():
+    from sqlmesh.core.console import set_console, NoopConsole
+
+    set_console(NoopConsole())
+
+
 @pytest.fixture
 def duck_conn() -> duckdb.DuckDBPyConnection:
     return duckdb.connect()
@@ -241,9 +254,12 @@ def push_plan(context: Context, plan: Plan) -> None:
         context.create_scheduler,
         context.default_catalog,
     )
-    plan_evaluator._push(plan.to_evaluatable(), plan.snapshots)
+    deployability_index = DeployabilityIndex.create(context.snapshots.values())
+    plan_evaluator._push(plan.to_evaluatable(), plan.snapshots, deployability_index)
     promotion_result = plan_evaluator._promote(plan.to_evaluatable(), plan.snapshots)
-    plan_evaluator._update_views(plan.to_evaluatable(), plan.snapshots, promotion_result)
+    plan_evaluator._update_views(
+        plan.to_evaluatable(), plan.snapshots, promotion_result, deployability_index
+    )
 
 
 @pytest.fixture()
@@ -362,8 +378,8 @@ def make_snapshot() -> t.Callable:
 def make_snapshot_on_destructive_change(make_snapshot: t.Callable) -> t.Callable:
     def _make_function(
         name: str = "a",
-        old_query: str = "select '1' as one, '2022-01-01' ds",
-        new_query: str = "select 1 as one, '2022-01-01' ds",
+        old_query: str = "select '1' as one, '2' as two, '2022-01-01' ds",
+        new_query: str = "select 1 as one, 2 as two, '2022-01-01' ds",
         on_destructive_change: OnDestructiveChange = OnDestructiveChange.ERROR,
     ) -> t.Tuple[Snapshot, Snapshot]:
         snapshot_old = make_snapshot(
@@ -421,7 +437,11 @@ def sushi_fixed_date_data_validator(sushi_context_fixed_date: Context) -> SushiD
 @pytest.fixture
 def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
     def _make_function(
-        klass: t.Type[T], dialect: t.Optional[str] = None, register_comments: bool = True
+        klass: t.Type[T],
+        dialect: t.Optional[str] = None,
+        register_comments: bool = True,
+        default_catalog: t.Optional[str] = None,
+        **kwargs: t.Any,
     ) -> T:
         connection_mock = mocker.NonCallableMock()
         cursor_mock = mocker.Mock()
@@ -431,11 +451,18 @@ def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
             lambda: connection_mock,
             dialect=dialect or klass.DIALECT,
             register_comments=register_comments,
+            default_catalog=default_catalog,
+            **kwargs,
         )
         if isinstance(adapter, SparkEngineAdapter):
             mocker.patch(
                 "sqlmesh.engines.spark.db_api.spark_session.SparkSessionConnection._spark_major_minor",
                 new_callable=PropertyMock(return_value=(3, 5)),
+            )
+        if isinstance(adapter, MSSQLEngineAdapter):
+            mocker.patch(
+                "sqlmesh.core.engine_adapter.mssql.MSSQLEngineAdapter.catalog_support",
+                new_callable=PropertyMock(return_value=CatalogSupport.REQUIRES_SET_CATALOG),
             )
         return adapter
 

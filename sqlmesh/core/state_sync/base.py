@@ -17,16 +17,13 @@ from sqlmesh.core.snapshot import (
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
     SnapshotTableInfo,
+    SnapshotNameVersion,
 )
 from sqlmesh.core.snapshot.definition import Interval, SnapshotIntervals
 from sqlmesh.utils import major_minor
 from sqlmesh.utils.date import TimeLike
 from sqlmesh.utils.errors import SQLMeshError
-from sqlmesh.utils.pydantic import (
-    PydanticModel,
-    field_validator,
-    field_validator_v1_args,
-)
+from sqlmesh.utils.pydantic import PydanticModel, ValidationInfo, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +67,10 @@ class PromotionResult(PydanticModel):
     removed_environment_naming_info: t.Optional[EnvironmentNamingInfo]
 
     @field_validator("removed_environment_naming_info")
-    @field_validator_v1_args
     def _validate_removed_environment_naming_info(
-        cls, v: t.Optional[EnvironmentNamingInfo], values: t.Any
+        cls, v: t.Optional[EnvironmentNamingInfo], info: ValidationInfo
     ) -> t.Optional[EnvironmentNamingInfo]:
-        if v and not values["removed"]:
+        if v and not info.data.get("removed"):
             raise ValueError("removed_environment_naming_info must be None if removed is empty")
         return v
 
@@ -170,6 +166,16 @@ class StateReader(abc.ABC):
     @abc.abstractmethod
     def state_type(self) -> str:
         """Returns the type of state sync."""
+
+    @abc.abstractmethod
+    def update_auto_restatements(
+        self, next_auto_restatement_ts: t.Dict[SnapshotNameVersion, t.Optional[int]]
+    ) -> None:
+        """Updates the next auto restatement timestamp for the snapshots.
+
+        Args:
+            next_auto_restatement_ts: A dictionary of snapshot name / version pairs to the next auto restatement timestamp.
+        """
 
     def get_versions(self, validate: bool = True) -> Versions:
         """Get the current versions of the SQLMesh schema and libraries.

@@ -4,7 +4,7 @@ from sqlglot import exp
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.helper import seq_get
 from sqlmesh.core.engine_adapter import SnowflakeEngineAdapter
-from sqlmesh.core.engine_adapter.snowflake import SnowflakeDataObject
+from sqlmesh.core.engine_adapter.shared import DataObject
 import sqlmesh.core.dialect as d
 from sqlmesh.core.model import SqlModel, load_sql_based_model
 from sqlmesh.core.plan import Plan
@@ -26,8 +26,6 @@ def test_type() -> str:
 def test_get_alter_expressions_includes_clustering(
     ctx: TestContext, engine_adapter: SnowflakeEngineAdapter
 ):
-    ctx.init()
-
     clustered_table = ctx.table("clustered_table")
     clustered_differently_table = ctx.table("clustered_differently_table")
     normal_table = ctx.table("normal_table")
@@ -78,7 +76,9 @@ def test_get_alter_expressions_includes_clustering(
     )
 
 
-def test_adding_clustered_by_forward_only(ctx: TestContext, engine_adapter: SnowflakeEngineAdapter):
+def test_mutating_clustered_by_forward_only(
+    ctx: TestContext, engine_adapter: SnowflakeEngineAdapter
+):
     model_name = ctx.table("TEST")
 
     sqlmesh = ctx.create_context()
@@ -107,11 +107,11 @@ def test_adding_clustered_by_forward_only(ctx: TestContext, engine_adapter: Snow
             ),
         )
 
-    def _get_data_object(table: exp.Table) -> SnowflakeDataObject:
+    def _get_data_object(table: exp.Table) -> DataObject:
         data_object = seq_get(engine_adapter.get_data_objects(table.db, {table.name}), 0)
         if not data_object:
             raise ValueError(f"Expected metadata for {table}")
-        return t.cast(SnowflakeDataObject, data_object)
+        return data_object
 
     m1 = _create_model()
     m2 = _create_model(clustered_by="PARTITIONDATE")

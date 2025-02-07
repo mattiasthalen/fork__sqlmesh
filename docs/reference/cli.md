@@ -24,6 +24,7 @@ Commands:
   create_test             Generate a unit test fixture for a given model.
   dag                     Render the DAG as an html file.
   diff                    Show the diff between the local state and the...
+  dlt_refresh             Attaches to a DLT pipeline with the option to...
   evaluate                Evaluate a model and return a dataframe with a...
   fetchdf                 Run a SQL query and display the results.
   format                  Format all SQL models and audits.
@@ -92,7 +93,7 @@ Usage: sqlmesh create_test [OPTIONS] MODEL
 
 Options:
   -q, --query <TEXT TEXT>...  Queries that will be used to generate data for
-                              the model's dependencies.  [required]
+                              the model's dependencies.
   -o, --overwrite             When true, the fixture file will be overwritten
                               in case it already exists.
   -v, --var <TEXT TEXT>...    Key-value pairs that will define variables
@@ -119,6 +120,19 @@ Usage: sqlmesh dag [OPTIONS] FILE
 Options:
   --select-model TEXT  Select specific models to include in the dag.
   --help               Show this message and exit.
+```
+
+## dlt_refresh
+
+```
+Usage: dlt_refresh PIPELINE [OPTIONS]
+
+  Attaches to a DLT pipeline with the option to update specific or all models of the SQLMesh project.
+
+Options:
+  -t, --table TEXT  The DLT tables to generate SQLMesh models from. When none specified, all new missing tables will be generated.
+  -f, --force       If set it will overwrite existing models with the new generated models from the DLT tables.
+  --help            Show this message and exit.
 ```
 
 ## diff
@@ -202,6 +216,8 @@ Usage: sqlmesh info [OPTIONS]
   data warehouse.
 
 Options:
+  --skip-connection  Skip the connection test.
+  -v, --verbose      Verbose output.
   --help  Show this message and exit.
 ```
 
@@ -214,7 +230,9 @@ Usage: sqlmesh init [OPTIONS] [SQL_DIALECT]
 
 Options:
   -t, --template TEXT  Project template. Supported values: airflow, dbt,
-                       default, empty.
+                       dlt, default, empty.
+  --dlt-pipeline TEXT  DLT pipeline for which to generate a SQLMesh project.
+                       For use with dlt template.
   --help               Show this message and exit.
 ```
 
@@ -260,7 +278,9 @@ Options:
   --help  Show this message and exit.
 ```
 
-**Caution**: this command affects all SQLMesh users. Contact your SQLMesh administrator before running.
+!!! danger "Caution"
+
+    The `migrate` command affects all SQLMesh users. Contact your SQLMesh administrator before running.
 
 ## plan
 
@@ -293,6 +313,10 @@ Options:
                                   matching models in the target environment.
   --skip-backfill, --dry-run      Skip the backfill step and only create a
                                   virtual update for the plan.
+  --empty-backfill                Produce empty backfill. Like --skip-backfill
+                                  no models will be backfilled, unlike --skip-
+                                  backfill missing intervals will be recorded
+                                  as if they were backfilled.
   --forward-only                  Create a plan for forward-only changes.
   --allow-destructive-model TEXT  Allow destructive forward-only changes to
                                   models whose names match the expression.
@@ -310,13 +334,14 @@ Options:
   --select-model TEXT             Select specific model changes that should be
                                   included in the plan.
   --backfill-model TEXT           Backfill only the models whose names match
-                                  the expression. This is supported only when
-                                  targeting a development environment.
+                                  the expression.
   --no-diff                       Hide text differences for changed models.
   --run                           Run latest intervals as part of the plan
                                   application (prod environment only).
   --enable-preview                Enable preview for forward-only models when
                                   targeting a development environment.
+  --diff-rendered                 Output text differences for rendered versions
+                                  of models and standalone audits
   -v, --verbose                   Verbose output.
   --help                          Show this message and exit.
 ```
@@ -387,7 +412,9 @@ Options:
   --help  Show this message and exit.
 ```
 
-**Caution**: this command affects all SQLMesh users. Contact your SQLMesh administrator before running.
+!!! danger "Caution"
+
+    The `rollback` command affects all SQLMesh users. Contact your SQLMesh administrator before running.
 
 ## run
 
@@ -397,14 +424,23 @@ Usage: sqlmesh run [OPTIONS] [ENVIRONMENT]
   Evaluate missing intervals for the target environment.
 
 Options:
-  -s, --start TEXT  The start datetime of the interval for which this command
-                    will be applied.
-  -e, --end TEXT    The end datetime of the interval for which this command
-                    will be applied.
-  --skip-janitor    Skip the janitor task.
-  --ignore-cron     Run for all missing intervals, ignoring individual cron
-                    schedules.
-  --help            Show this message and exit.
+  -s, --start TEXT              The start datetime of the interval for which
+                                this command will be applied.
+  -e, --end TEXT                The end datetime of the interval for which
+                                this command will be applied.
+  --skip-janitor                Skip the janitor task.
+  --ignore-cron                 Run for all missing intervals, ignoring
+                                individual cron schedules.
+  --select-model TEXT           Select specific models to run. Note: this
+                                always includes upstream dependencies.
+  --exit-on-env-update INTEGER  If set, the command will exit with the
+                                specified code if the run is interrupted by an
+                                update to the target environment.
+  --no-auto-upstream            Do not automatically include upstream models.
+                                Only applicable when --select-model is used.
+                                Note: this may result in missing / invalid
+                                data for the selected models.
+  --help                        Show this message and exit.
 ```
 
 ## table_diff
@@ -428,6 +464,9 @@ Options:
                            floating point columns. Default: 3
   --skip-grain-check       Disable the check for a primary key (grain) that is
                            missing or is not unique.
+  --temp-schema TEXT       Schema used for temporary tables. It can be
+                           `CATALOG.SCHEMA` or `SCHEMA`. Default:
+                           `sqlmesh_temp`
   --help                   Show this message and exit.
 ```
 
@@ -469,6 +508,6 @@ Usage: sqlmesh ui [OPTIONS]
 Options:
   --host TEXT                     Bind socket to this host. Default: 127.0.0.1
   --port INTEGER                  Bind socket to this port. Default: 8000
-  --mode [ide|default|docs|plan]  Mode to start the UI in. Default: default
+  --mode [ide|catalog|docs|plan]  Mode to start the UI in. Default: ide
   --help                          Show this message and exit.
 ```

@@ -61,15 +61,15 @@ Global variable values may be any of the data types in the table below or lists 
 
 Configuration for the `sqlmesh plan` command.
 
-| Option                    | Description                                                                                                                                                                                                                                             |         Type         | Required |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------: | :------: |
-| `auto_categorize_changes` | Indicates whether SQLMesh should attempt to automatically [categorize](../concepts/plans.md#change-categories) model changes during plan creation per each model source type ([additional details](../guides/configuration.md#auto-categorize-changes)) | dict[string, string] |    N     |
-| `include_unmodified`      | Indicates whether to create views for all models in the target development environment or only for modified ones (Default: False)                                                                                                                       |       boolean        |    N     |
-| `auto_apply`              | Indicates whether to automatically apply a new plan after creation (Default: False)                                                                                                                                                                     |       boolean        |    N     |
-| `forward_only`            | Indicates whether the plan should be [forward-only](../concepts/plans.md#forward-only-plans) (Default: False)                                                                                                                                           |       boolean        |    N     |
-| `enable_preview`          | Indicates whether to enable [data preview](../concepts/plans.md#data-preview) for forward-only models when targeting a development environment (Default: False)                                                                                         |       boolean        |    N     |
-| `no_diff`                 | Don't show diffs for changed models (Default: False)                                                                                                                                                                                                    |       boolean        |    N     |
-| `no_prompts`              | Disables interactive prompts in CLI (Default: False)                                                                                                                                                                                                    |       boolean        |    N     |
+| Option                    | Description                                                                                                                                                                                                                                             | Type                 | Required |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------------------:|:--------:|
+| `auto_categorize_changes` | Indicates whether SQLMesh should attempt to automatically [categorize](../concepts/plans.md#change-categories) model changes during plan creation per each model source type ([additional details](../guides/configuration.md#auto-categorize-changes)) | dict[string, string] | N        |
+| `include_unmodified`      | Indicates whether to create views for all models in the target development environment or only for modified ones (Default: False)                                                                                                                       | boolean              | N        |
+| `auto_apply`              | Indicates whether to automatically apply a new plan after creation (Default: False)                                                                                                                                                                     | boolean              | N        |
+| `forward_only`            | Indicates whether the plan should be [forward-only](../concepts/plans.md#forward-only-plans) (Default: False)                                                                                                                                           | boolean              | N        |
+| `enable_preview`          | Indicates whether to enable [data preview](../concepts/plans.md#data-preview) for forward-only models when targeting a development environment (Default: True, except for dbt projects where the target engine does not support cloning)                | Boolean              | N        |
+| `no_diff`                 | Don't show diffs for changed models (Default: False)                                                                                                                                                                                                    | boolean              | N        |
+| `no_prompts`              | Disables interactive prompts in CLI (Default: True)                                                                                                                                                                                                     | boolean              | N        |
 
 ## Run
 
@@ -164,16 +164,19 @@ Most parameters are specific to the connection engine `type` - see [below](#engi
 
 | Option              | Description                                                                                                                                                             | Type | Required |
 |---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----:|:--------:|
-| `type`              | The engine type name, listed in engine-specific configuration pages below.                                                                                              | str  | Y        |
-| `concurrent_tasks`  | The maximum number of concurrent tasks that will be run by SQLMesh. (Default: 4 for engines that support concurrent tasks.)                                             | int  | N        |
-| `register_comments` | Whether SQLMesh should register model comments with the SQL engine (if the engine supports it). (Default: `true`.)                                                      | bool | N        |
-| `pre_ping`          | Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive. This can only be enabled for engines with transaction support. | bool | N        |
+| `type`              | The engine type name, listed in engine-specific configuration pages below.                                                                                              | str  |    Y     |
+| `concurrent_tasks`  | The maximum number of concurrent tasks that will be run by SQLMesh. (Default: 4 for engines that support concurrent tasks.)                                             | int  |    N     |
+| `register_comments` | Whether SQLMesh should register model comments with the SQL engine (if the engine supports it). (Default: `true`.)                                                      | bool |    N     |
+| `pre_ping`          | Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive. This can only be enabled for engines with transaction support. | bool |    N     |
+| `pretty_sql`        | If SQL should be formatted before being executed, not recommended in a production setting. (Default: `false`.)                                                          | bool |    N     |
 
 #### Engine-specific
 
 These pages describe the connection configuration options for each execution engine.
 
+* [Athena](../integrations/engines/athena.md)
 * [BigQuery](../integrations/engines/bigquery.md)
+* [ClickHouse](../integrations/engines/clickhouse.md)
 * [Databricks](../integrations/engines/databricks.md)
 * [DuckDB](../integrations/engines/duckdb.md)
 * [MotherDuck](../integrations/engines/motherduck.md)
@@ -226,6 +229,17 @@ See [Airflow Integration Guide](../integrations/airflow.md) for information abou
 **Type:** `cloud_composer`
 
 The Google Cloud Composer scheduler type shares the same configuration options as the `airflow` type, except for `username` and `password`. Cloud Composer relies on `gcloud` authentication, so the `username` and `password` options are not required.
+
+#### YC Airflow
+
+**Type:** `yc_airflow`
+
+Yandex Managed Airflow shares similar configuration options with the standard `airflow` type, with the following exceptions:
+
+- `max_snapshot_ids_per_request`: This option is deprecated and not supported.
+- Authentication: YC Airflow requires additional credentials, including both a `token` and a combination of `username` and `password`.
+
+Unlike the `airflow` type, YC Airflow leverages Yandex Cloud's internal authentication mechanisms. Therefore, all requests to the Airflow API must include a valid Yandex Cloud IAM-token for authentication.
 
 ## Gateway/connection defaults
 

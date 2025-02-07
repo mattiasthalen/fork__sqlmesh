@@ -70,6 +70,9 @@ jobs:
           name: Install SQLMesh and dbt adapter dependencies
           command: make install-cicd-test
       - run:
+          name: Fix Git URL override
+          command: git config --global --unset url."ssh://git@github.com".insteadOf
+      - run:
           name: Run linters and code style checks
           command: make py-style
       - run:
@@ -77,34 +80,6 @@ jobs:
           command: make cicd-test
       - store_test_results:
           path: test-results
-
-  style_and_slow_tests_pydantic_v1:
-    docker:
-      - image: cimg/python:3.10
-    resource_class: large
-    environment:
-      PYTEST_XDIST_AUTO_NUM_WORKERS: 8
-    steps:
-      - halt_unless_core
-      - checkout
-      - run:
-          name: Install OpenJDK
-          command: sudo apt-get update && sudo apt-get install default-jdk
-      - run:
-          name: Install ODBC
-          command: sudo apt-get install unixodbc-dev
-      - run:
-          name: Install SQLMesh and dbt adapter dependencies
-          command: make install-cicd-test
-      - run:
-          name: Install Pydantic v1
-          command: pip install --upgrade "pydantic<2.0.0" && pip uninstall pydantic_core -y
-      - run:
-          name: Run linters and code style checks
-          command: make py-style
-      - run:
-          name: Run slow tests
-          command: make cicd-test
 
   migration_test:
     docker:
@@ -121,7 +96,7 @@ jobs:
 
   ui_style:
     docker:
-      - image: cimg/python:3.8
+      - image: cimg/python:3.9
     resource_class: small
     steps:
       - halt_unless_client
@@ -136,6 +111,9 @@ jobs:
       - run:
           name: Install pre-commit
           command: pip install pre-commit
+      - run:
+          name: Fix Git URL override
+          command: git config --global --unset url."ssh://git@github.com".insteadOf
       - run:
           name: Run linters and code style checks
           command: make ui-style
@@ -197,16 +175,20 @@ jobs:
 
   trigger_private_tests:
       docker:
-        - image: cimg/base:2021.11
+        - image: cimg/python:3.12.0
       resource_class: small
       steps:
         - checkout
         - run:
+            name: Install setuptools scm
+            command: pip install setuptools_scm
+        - run:
             name: Trigger private tests
             command: |
-              echo 'export COMMIT_MESSAGE="$(git log --format=%s -n 1 $CIRCLE_SHA1)"' >> "$BASH_ENV"
-              echo 'export FORMATTED_COMMIT_MESSAGE="${COMMIT_MESSAGE//\"/\\\"}"' >> "$BASH_ENV"
-              source "$BASH_ENV"
+              export COMMIT_MESSAGE="$(git log --format=%s -n 1 $CIRCLE_SHA1)"
+              export FORMATTED_COMMIT_MESSAGE="${COMMIT_MESSAGE//\"/\\\"}"
+              # returns a version string like 0.1.0.dev11
+              export PACKAGE_VERSION="$(python ./.circleci/get_scm_version.py)"
               curl --request POST \
                 --url $TOBIKO_PRIVATE_CIRCLECI_URL \
                 --header "Circle-Token: $TOBIKO_PRIVATE_CIRCLECI_KEY" \
@@ -219,7 +201,8 @@ jobs:
                     "sqlmesh_branch":"'$CIRCLE_BRANCH'",
                     "sqlmesh_commit_author":"'$CIRCLE_USERNAME'",
                     "sqlmesh_commit_hash":"'$CIRCLE_SHA1'",
-                    "sqlmesh_commit_message":"'"$FORMATTED_COMMIT_MESSAGE"'"
+                    "sqlmesh_commit_message":"'"$FORMATTED_COMMIT_MESSAGE"'",
+                    "sqlmesh_package_version":"'$PACKAGE_VERSION'"
                     }
                 }'
 
@@ -291,12 +274,10 @@ workflows:
           matrix:
             parameters:
               python_version:
-                - "3.8"
                 - "3.9"
                 - "3.10"
                 - "3.11"
                 - "3.12"
-      - style_and_slow_tests_pydantic_v1
       - airflow_docker_tests:
           requires:
             - style_and_slow_tests

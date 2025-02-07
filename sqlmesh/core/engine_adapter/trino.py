@@ -1,16 +1,19 @@
 from __future__ import annotations
+import re
 import typing as t
 from functools import lru_cache
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype  # type: ignore
 from sqlglot import exp
 from sqlglot.helper import seq_get
+from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_result
 
 from sqlmesh.core.dialect import schema_, to_schema
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
     HiveMetastoreTablePropertiesMixin,
     PandasNativeFetchDFSupportMixin,
+    RowDiffMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CatalogSupport,
@@ -35,10 +38,10 @@ class TrinoEngineAdapter(
     PandasNativeFetchDFSupportMixin,
     HiveMetastoreTablePropertiesMixin,
     GetCurrentCatalogFromFunctionMixin,
+    RowDiffMixin,
 ):
     DIALECT = "trino"
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.INTO_IS_OVERWRITE
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     # Trino does technically support transactions but it doesn't work correctly with partition overwrite so we
     # disable transactions. If we need to get them enabled again then we would need to disable auto commit on the
     # connector and then figure out how to get insert/overwrite to work correctly without it.
@@ -57,6 +60,17 @@ class TrinoEngineAdapter(
             exp.DataType.build("TIMESTAMP", dialect=DIALECT).this: [(3,)],
         },
     )
+    # some catalogs support microsecond (precision 6) but it has to be specifically enabled (Hive) or just isnt available (Delta / TIMESTAMP WITH TIME ZONE)
+    # and even if you have a TIMESTAMP(6) the date formatting functions still only support millisecond precision
+    MAX_TIMESTAMP_PRECISION = 3
+
+    @property
+    def schema_location_mapping(self) -> t.Optional[dict[re.Pattern, str]]:
+        return self._extra_config.get("schema_location_mapping")
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
 
     def set_current_catalog(self, catalog: str) -> None:
         """Sets the catalog name of the current connection."""
@@ -81,6 +95,7 @@ class TrinoEngineAdapter(
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         where: t.Optional[exp.Condition] = None,
         insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
+        **kwargs: t.Any,
     ) -> None:
         catalog = exp.to_table(table_name).catalog or self.get_current_catalog()
 
@@ -271,3 +286,79 @@ class TrinoEngineAdapter(
         }
 
         return delta_columns_to_types
+
+    @retry(wait=wait_fixed(1), stop=stop_after_attempt(10), retry=retry_if_result(lambda v: not v))
+    def _block_until_table_exists(self, table_name: TableName) -> bool:
+        return self.table_exists(table_name)
+
+    def _create_schema(
+        self,
+        schema_name: SchemaName,
+        ignore_if_exists: bool,
+        warn_on_error: bool,
+        properties: t.List[exp.Expression],
+        kind: str,
+    ) -> None:
+        if mapped_location := self._schema_location(schema_name):
+            properties.append(exp.LocationProperty(this=exp.Literal.string(mapped_location)))
+
+        return super()._create_schema(
+            schema_name=schema_name,
+            ignore_if_exists=ignore_if_exists,
+            warn_on_error=warn_on_error,
+            properties=properties,
+            kind=kind,
+        )
+
+    def _create_table(
+        self,
+        table_name_or_schema: t.Union[exp.Schema, TableName],
+        expression: t.Optional[exp.Expression],
+        exists: bool = True,
+        replace: bool = False,
+        columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        table_kind: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        super()._create_table(
+            table_name_or_schema=table_name_or_schema,
+            expression=expression,
+            exists=exists,
+            replace=replace,
+            columns_to_types=columns_to_types,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            table_kind=table_kind,
+            **kwargs,
+        )
+
+        # extract the table name
+        if isinstance(table_name_or_schema, exp.Schema):
+            table_name = table_name_or_schema.this
+            assert isinstance(table_name, exp.Table)
+        else:
+            table_name = table_name_or_schema
+
+        if self.current_catalog_type == "hive":
+            # the Trino Hive connector can take a few seconds for metadata changes to propagate to all internal threads
+            # (even if metadata TTL is set to 0s)
+            # Blocking until the table shows up means that subsequent code expecting it to exist immediately will not fail
+            self._block_until_table_exists(table_name)
+
+    def _schema_location(self, schema_name: SchemaName) -> t.Optional[str]:
+        if mapping := self.schema_location_mapping:
+            schema = to_schema(schema_name)
+            match_key = schema.db
+
+            # only consider the catalog if it is present
+            if catalog := schema.catalog:
+                match_key = f"{catalog}.{match_key}"
+
+            for k, v in mapping.items():
+                if re.match(k, match_key):
+                    return v.replace("@{schema_name}", schema.db).replace(
+                        "@{catalog_name}", schema.catalog
+                    )
+        return None

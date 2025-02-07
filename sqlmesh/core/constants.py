@@ -70,6 +70,7 @@ TESTS = "tests"
 
 EXTERNAL_MODELS_YAML = "external_models.yaml"
 EXTERNAL_MODELS_DEPRECATED_YAML = "schema.yaml"
+REQUIREMENTS = "sqlmesh-requirements.lock"
 
 DEFAULT_SCHEMA = "default"
 
@@ -87,3 +88,5 @@ AIRFLOW = "airflow"
 DBT = "dbt"
 NATIVE = "native"
 HYBRID = "hybrid"
+
+DISABLE_SQLMESH_STATE_MIGRATION = "SQLMESH__AIRFLOW__DISABLE_STATE_MIGRATION"

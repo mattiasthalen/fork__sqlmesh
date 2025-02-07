@@ -5,11 +5,13 @@ import os
 import pathlib
 import sys
 import typing as t
+import shutil
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
+import pytz
 from sqlglot import exp, parse_one
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
@@ -17,15 +19,26 @@ from sqlmesh import Config, Context
 from sqlmesh.cli.example_project import init_example_project
 from sqlmesh.core.config import load_config_from_paths
 import sqlmesh.core.dialect as d
+from sqlmesh.core.dialect import select_from_values
 from sqlmesh.core.model import Model, load_sql_based_model
 from sqlmesh.core.engine_adapter.shared import DataObject, DataObjectType
+from sqlmesh.core.engine_adapter.mixins import RowDiffMixin
 from sqlmesh.core.model.definition import create_sql_model
 from sqlmesh.core.plan import Plan
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
-from sqlmesh.utils.date import now, to_date, to_time_column, yesterday
+from sqlmesh.utils.date import now, to_date, to_time_column
+from sqlmesh.core.table_diff import TableDiff
 from sqlmesh.utils.pydantic import PydanticModel
 from tests.conftest import SushiDataValidator
-from tests.core.engine_adapter.integration import TestContext, MetadataResults, TEST_SCHEMA
+from tests.core.engine_adapter.integration import (
+    TestContext,
+    MetadataResults,
+    TEST_SCHEMA,
+    wait_until,
+)
+
+DATA_TYPE = exp.DataType.Type
+VARCHAR_100 = exp.DataType.build("varchar(100)")
 
 
 class PlanResults(PydanticModel):
@@ -79,6 +92,9 @@ def test_type(request):
                 pytest.mark.duckdb,
                 pytest.mark.engine,
                 pytest.mark.slow,
+                # the duckdb tests cannot run concurrently because many of them point at the same files
+                # and duckdb does not support multi process read/write on the same files
+                # ref: https://duckdb.org/docs/connect/concurrency.html#writing-to-duckdb-from-multiple-processes
                 pytest.mark.xdist_group("engine_integration_duckdb"),
             ],
         ),
@@ -88,7 +104,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.postgres,
-                pytest.mark.xdist_group("engine_integration_postgres"),
             ],
         ),
         pytest.param(
@@ -97,7 +112,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.mysql,
-                pytest.mark.xdist_group("engine_integration_mysql"),
             ],
         ),
         pytest.param(
@@ -106,7 +120,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.mssql,
-                pytest.mark.xdist_group("engine_integration_mssql"),
             ],
         ),
         pytest.param(
@@ -115,7 +128,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino,
-                pytest.mark.xdist_group("engine_integration_trino"),
             ],
         ),
         pytest.param(
@@ -124,7 +136,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino_iceberg,
-                pytest.mark.xdist_group("engine_integration_trino_iceberg"),
             ],
         ),
         pytest.param(
@@ -133,7 +144,14 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino_delta,
-                pytest.mark.xdist_group("engine_integration_trino_delta"),
+            ],
+        ),
+        pytest.param(
+            "trino_nessie",
+            marks=[
+                pytest.mark.docker,
+                pytest.mark.engine,
+                pytest.mark.trino_nessie,
             ],
         ),
         pytest.param(
@@ -142,7 +160,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.spark,
-                pytest.mark.xdist_group("engine_integration_spark"),
             ],
         ),
         pytest.param(
@@ -151,7 +168,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.clickhouse,
-                pytest.mark.xdist_group("engine_integration_clickhouse"),
             ],
         ),
         pytest.param(
@@ -160,7 +176,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.clickhouse_cluster,
-                pytest.mark.xdist_group("engine_integration_clickhouse_cluster"),
             ],
         ),
         pytest.param(
@@ -169,7 +184,6 @@ def test_type(request):
                 pytest.mark.bigquery,
                 pytest.mark.engine,
                 pytest.mark.remote,
-                pytest.mark.xdist_group("engine_integration_bigquery"),
             ],
         ),
         pytest.param(
@@ -178,7 +192,6 @@ def test_type(request):
                 pytest.mark.databricks,
                 pytest.mark.engine,
                 pytest.mark.remote,
-                pytest.mark.xdist_group("engine_integration_databricks"),
             ],
         ),
         # TODO: add motherduck tests once they support DuckDB>=0.10.0
@@ -188,7 +201,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.redshift,
-                pytest.mark.xdist_group("engine_integration_redshift"),
             ],
         ),
         pytest.param(
@@ -197,7 +209,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.snowflake,
-                pytest.mark.xdist_group("engine_integration_snowflake"),
             ],
         ),
         pytest.param(
@@ -206,7 +217,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.clickhouse_cloud,
-                pytest.mark.xdist_group("engine_integration_clickhouse_cloud"),
             ],
         ),
         pytest.param(
@@ -215,7 +225,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.athena,
-                pytest.mark.xdist_group("engine_integration_athena"),
             ],
         ),
         pytest.param(
@@ -224,7 +233,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.athena,
-                pytest.mark.xdist_group("engine_integration_athena"),
             ],
         ),
     ]
@@ -249,8 +257,8 @@ def test_connection(ctx: TestContext):
 
 def test_catalog_operations(ctx: TestContext):
     if (
-        ctx.engine_adapter.CATALOG_SUPPORT.is_unsupported
-        or ctx.engine_adapter.CATALOG_SUPPORT.is_single_catalog_only
+        ctx.engine_adapter.catalog_support.is_unsupported
+        or ctx.engine_adapter.catalog_support.is_single_catalog_only
     ):
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
@@ -306,7 +314,7 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
         assert len(results.materialized_views) == 0
         assert len(results.non_temp_tables) == 2
 
-    if ctx.engine_adapter.CATALOG_SUPPORT.is_unsupported:
+    if ctx.engine_adapter.catalog_support.is_unsupported:
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
         )
@@ -326,7 +334,7 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
     ctx.create_catalog(catalog_name)
 
     schema = ctx.schema("drop_schema_catalog_test", catalog_name)
-    if ctx.engine_adapter.CATALOG_SUPPORT.is_single_catalog_only:
+    if ctx.engine_adapter.catalog_support.is_single_catalog_only:
         drop_schema_and_validate(schema)
         assert "requires that all catalog operations be against a single catalog" in caplog.text
         return
@@ -338,7 +346,6 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
 
 
 def test_temp_table(ctx: TestContext):
-    ctx.init()
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -364,7 +371,6 @@ def test_temp_table(ctx: TestContext):
 
 def test_create_table(ctx: TestContext):
     table = ctx.table("test_table")
-    ctx.init()
     ctx.engine_adapter.create_table(
         table,
         {"id": exp.DataType.build("int")},
@@ -386,8 +392,8 @@ def test_create_table(ctx: TestContext):
 
 
 def test_ctas(ctx: TestContext):
-    ctx.init()
     table = ctx.table("test_table")
+
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -402,7 +408,8 @@ def test_ctas(ctx: TestContext):
         column_descriptions={"id": "test id column description"},
         table_format=ctx.default_table_format,
     )
-    results = ctx.get_metadata_results()
+
+    results = ctx.get_metadata_results(schema=table.db)
     assert len(results.views) == 0
     assert len(results.materialized_views) == 0
     assert len(results.tables) == len(results.non_temp_tables) == 1
@@ -410,8 +417,8 @@ def test_ctas(ctx: TestContext):
     ctx.compare_with_current(table, input_data)
 
     if ctx.engine_adapter.COMMENT_CREATION_TABLE.is_supported:
-        table_description = ctx.get_table_comment(table.db, "test_table")
-        column_comments = ctx.get_column_comments(table.db, "test_table")
+        table_description = ctx.get_table_comment(table.db, table.name)
+        column_comments = ctx.get_column_comments(table.db, table.name)
 
         assert table_description == "test table description"
         assert column_comments == {"id": "test id column description"}
@@ -430,7 +437,6 @@ def test_create_view(ctx: TestContext):
         ]
     )
     view = ctx.table("test_view")
-    ctx.init()
     ctx.engine_adapter.create_view(
         view,
         ctx.input_data(input_data),
@@ -480,7 +486,6 @@ def test_materialized_view(ctx: TestContext):
             {"id": 3, "ds": "2022-01-03"},
         ]
     )
-    ctx.init()
     source_table = ctx.table("source_table")
     ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
     view = ctx.table("test_view")
@@ -531,7 +536,6 @@ def test_nan_roundtrip(ctx: TestContext):
     if ctx.test_type != "df":
         pytest.skip("NaN roundtrip test only relevant for dataframes.")
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = sys.maxsize
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -557,7 +561,6 @@ def test_nan_roundtrip(ctx: TestContext):
 
 def test_replace_query(ctx: TestContext):
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = sys.maxsize
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -614,7 +617,6 @@ def test_replace_query(ctx: TestContext):
 
 def test_replace_query_batched(ctx: TestContext):
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = 1
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -670,7 +672,6 @@ def test_replace_query_batched(ctx: TestContext):
 
 
 def test_insert_append(ctx: TestContext):
-    ctx.init()
     table = ctx.table("test_table")
     ctx.engine_adapter.create_table(
         table, ctx.columns_to_types, table_format=ctx.default_table_format
@@ -718,7 +719,6 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
         ds_type = "varchar(max)"
 
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
-    ctx.init()
     table = ctx.table("test_table")
     if ctx.dialect == "bigquery":
         partitioned_by = ["DATE(ds)"]
@@ -751,8 +751,12 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
     assert len(results.views) == 0
     assert len(results.materialized_views) == 0
     assert len(results.tables) == len(results.non_temp_tables) == 1
-    assert len(results.non_temp_tables) == 1
     assert results.non_temp_tables[0] == table.name
+
+    if ctx.dialect == "trino":
+        # trino has some lag between partitions being registered and data showing up
+        wait_until(lambda: len(ctx.get_current_data(table)) > 0)
+
     ctx.compare_with_current(table, input_data.iloc[1:])
 
     if ctx.test_type == "df":
@@ -777,6 +781,10 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
         assert len(results.materialized_views) == 0
         assert len(results.tables) == len(results.non_temp_tables) == 1
         assert results.non_temp_tables[0] == table.name
+
+        if ctx.dialect == "trino":
+            wait_until(lambda: len(ctx.get_current_data(table)) > 2)
+
         ctx.compare_with_current(
             table,
             pd.DataFrame(
@@ -794,7 +802,6 @@ def test_merge(ctx: TestContext):
     if not ctx.supports_merge:
         pytest.skip(f"{ctx.dialect} doesn't support merge")
 
-    ctx.init()
     table = ctx.table("test_table")
 
     # Athena only supports MERGE on Iceberg tables
@@ -870,7 +877,6 @@ def test_scd_type_2_by_time(ctx: TestContext):
         "valid_from": time_type,
         "valid_to": time_type,
     }
-    ctx.init()
     table = ctx.table("test_table")
     input_schema = {
         k: v for k, v in ctx.columns_to_types.items() if k not in ("valid_from", "valid_to")
@@ -1024,7 +1030,6 @@ def test_scd_type_2_by_column(ctx: TestContext):
         "valid_from": time_type,
         "valid_to": time_type,
     }
-    ctx.init()
     table = ctx.table("test_table")
     input_schema = {
         k: v for k, v in ctx.columns_to_types.items() if k not in ("valid_from", "valid_to")
@@ -1189,7 +1194,6 @@ def test_scd_type_2_by_column(ctx: TestContext):
 def test_get_data_objects(ctx: TestContext):
     table = ctx.table("test_table")
     view = ctx.table("test_view")
-    ctx.init()
     ctx.engine_adapter.create_table(
         table,
         {"id": exp.DataType.build("int")},
@@ -1265,7 +1269,6 @@ def test_truncate_table(ctx: TestContext):
     if ctx.test_type != "query":
         pytest.skip("Truncate table test does not change based on input data type")
 
-    ctx.init()
     table = ctx.table("test_table")
 
     ctx.engine_adapter.create_table(
@@ -1290,7 +1293,6 @@ def test_transaction(ctx: TestContext):
     if ctx.test_type != "query":
         pytest.skip("Transaction test can just run for query")
 
-    ctx.init()
     table = ctx.table("test_table")
     input_data = pd.DataFrame(
         [
@@ -1311,7 +1313,7 @@ def test_transaction(ctx: TestContext):
     ctx.compare_with_current(table, input_data)
 
 
-def test_sushi(ctx: TestContext):
+def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
     if ctx.test_type != "query":
         pytest.skip("Sushi end-to-end tests only need to run for query")
 
@@ -1319,6 +1321,12 @@ def test_sushi(ctx: TestContext):
         pytest.skip(
             "Sushi end-to-end tests only need to run once for Athena because sushi needs a hybrid of both Hive and Iceberg"
         )
+
+    tmp_path = tmp_path_factory.mktemp(f"sushi_{ctx.test_id}")
+
+    sushi_test_schema = ctx.add_test_suffix("sushi")
+    sushi_state_schema = ctx.add_test_suffix("sushi_state")
+    raw_test_schema = ctx.add_test_suffix("raw")
 
     config = load_config_from_paths(
         Config,
@@ -1328,34 +1336,43 @@ def test_sushi(ctx: TestContext):
         personal_paths=[pathlib.Path("~/.sqlmesh/config.yaml").expanduser()],
     )
 
+    # To enable parallelism in integration tests
+    config.gateways = {ctx.gateway: config.gateways[ctx.gateway]}
+    current_gateway_config = config.gateways[ctx.gateway]
+    current_gateway_config.state_schema = sushi_state_schema
+
     if ctx.dialect == "athena":
         # Ensure that this test is using the same s3_warehouse_location as TestContext (which includes the testrun_id)
-        config.gateways[
-            ctx.gateway
-        ].connection.s3_warehouse_location = ctx.engine_adapter.s3_warehouse_location
+        current_gateway_config.connection.s3_warehouse_location = (
+            ctx.engine_adapter.s3_warehouse_location
+        )
 
-    # clear cache from prior runs
-    cache_dir = pathlib.Path("./examples/sushi/.cache")
-    if cache_dir.exists():
-        import shutil
+    # Copy sushi example to tmpdir
+    shutil.copytree(pathlib.Path("./examples/sushi"), tmp_path, dirs_exist_ok=True)
 
-        shutil.rmtree(cache_dir)
+    # Rewrite schema references to test schema references
+    # Note that we deliberately do it at the filesystem level instead of messing with the Context to ensure
+    # that we are testing an actual Context rather than a doctored one
+    extensions = ["*.sql", "*.yaml", "*.py"]
+    replacements = {
+        "sushi.": f"{sushi_test_schema}.",
+        'sushi".': f'{sushi_test_schema}".',
+        " raw.": f" {raw_test_schema}.",
+        "NOT EXISTS raw;": f" NOT EXISTS {raw_test_schema};",
+    }
+    for ext in extensions:
+        for f in tmp_path.rglob(ext):
+            if f.is_file():
+                contents = f.read_text()
+                for search, replace in replacements.items():
+                    contents = contents.replace(search, replace)
+                f.write_text(contents)
 
-    context = Context(paths="./examples/sushi", config=config, gateway=ctx.gateway)
+    context = Context(paths=tmp_path, config=config, gateway=ctx.gateway)
 
-    # clean up any leftover schemas from previous runs (requires context)
-    for schema in [
-        "sushi__test_prod",
-        "sushi__test_dev",
-        "sushi",
-        "sqlmesh__sushi",
-        "sqlmesh",
-        "raw",
-    ]:
-        context.engine_adapter.drop_schema(schema, ignore_if_not_exists=True, cascade=True)
-
-    start = to_date(now() - timedelta(days=7))
     end = now()
+    start = to_date(end - timedelta(days=7))
+    yesterday = to_date(end - timedelta(days=1))
 
     # Databricks requires the table property `delta.columnMapping.mode = 'name'` for
     # spaces in column names. Other engines error if it is set in the model definition,
@@ -1405,12 +1422,14 @@ def test_sushi(ctx: TestContext):
 
         # create raw schema and view
         if ctx.gateway == "inttest_clickhouse_cluster":
-            context.engine_adapter.execute("CREATE DATABASE IF NOT EXISTS raw ON CLUSTER cluster1;")
             context.engine_adapter.execute(
-                "DROP VIEW IF EXISTS raw.demographics ON CLUSTER cluster1;"
+                f"CREATE DATABASE IF NOT EXISTS {raw_test_schema} ON CLUSTER cluster1;"
             )
             context.engine_adapter.execute(
-                "CREATE VIEW raw.demographics ON CLUSTER cluster1 AS SELECT 1 AS customer_id, '00000' AS zip;"
+                f"DROP VIEW IF EXISTS {raw_test_schema}.demographics ON CLUSTER cluster1;"
+            )
+            context.engine_adapter.execute(
+                f"CREATE VIEW {raw_test_schema}.demographics ON CLUSTER cluster1 AS SELECT 1 AS customer_id, '00000' AS zip;"
             )
 
     if ctx.dialect == "athena":
@@ -1430,11 +1449,11 @@ def test_sushi(ctx: TestContext):
         auto_apply=True,
     )
 
-    data_validator = SushiDataValidator.from_context(context)
+    data_validator = SushiDataValidator.from_context(context, sushi_schema_name=sushi_test_schema)
     data_validator.validate(
-        "sushi.customer_revenue_lifetime",
+        f"{sushi_test_schema}.customer_revenue_lifetime",
         start,
-        yesterday(),
+        yesterday,
         env_name="test_prod",
         dialect=ctx.dialect,
         environment_naming_info=plan.environment_naming_info,
@@ -1464,10 +1483,6 @@ def test_sushi(ctx: TestContext):
             "customers": {
                 "table": "Sushi customer data",
                 "column": {"customer_id": "customer_id uniquely identifies customers"},
-            },
-            "marketing": {
-                "table": "Sushi marketing data",
-                "column": {"customer_id": "customer_id uniquely identifies customers \\"},
             },
             "orders": {
                 "table": "Table of sushi orders.",
@@ -1625,25 +1640,26 @@ def test_sushi(ctx: TestContext):
 
             return None
 
-        # confirm physical layer comments are registered
-        validate_comments("sqlmesh__sushi")
-        # confirm physical temp table comments are not registered
-        validate_no_comments("sqlmesh__sushi", table_name_suffix="__temp", check_temp_tables=True)
+        validate_comments(f"sqlmesh__{sushi_test_schema}", prod_schema_name=sushi_test_schema)
+
         # confirm view layer comments are not registered in non-PROD environment
         env_name = "test_prod"
         if plan.environment_naming_info and plan.environment_naming_info.normalize_name:
             env_name = normalize_identifiers(env_name, dialect=ctx.dialect).name
-        validate_no_comments(f"sushi__{env_name}", is_physical_layer=False)
+        validate_no_comments(
+            f"{sushi_test_schema}__{env_name}",
+            is_physical_layer=False,
+            prod_schema_name=sushi_test_schema,
+        )
 
     # Ensure that the plan has been applied successfully.
-    no_change_plan: Plan = context.plan(
+    no_change_plan: Plan = context.plan_builder(
         environment="test_dev",
         start=start,
         end=end,
         skip_tests=True,
-        no_prompts=True,
         include_unmodified=True,
-    )
+    ).build()
     assert not no_change_plan.requires_backfill
     assert no_change_plan.context_diff.is_new_environment
 
@@ -1651,9 +1667,9 @@ def test_sushi(ctx: TestContext):
     context.apply(no_change_plan)
 
     data_validator.validate(
-        "sushi.customer_revenue_lifetime",
+        f"{sushi_test_schema}.customer_revenue_lifetime",
         start,
-        yesterday(),
+        yesterday,
         env_name="test_dev",
         dialect=ctx.dialect,
         environment_naming_info=no_change_plan.environment_naming_info,
@@ -1662,18 +1678,33 @@ def test_sushi(ctx: TestContext):
     # confirm view layer comments are registered in PROD
     if ctx.engine_adapter.COMMENT_CREATION_VIEW.is_supported:
         context.plan(skip_tests=True, no_prompts=True, auto_apply=True)
-        validate_comments("sushi", is_physical_layer=False)
+        validate_comments(sushi_test_schema, is_physical_layer=False)
+
+    # Register schemas for cleanup
+    for schema in [
+        f"{sushi_test_schema}__test_prod",
+        f"{sushi_test_schema}__test_dev",
+        sushi_test_schema,
+        f"sqlmesh__{sushi_test_schema}",
+        sushi_state_schema,
+        raw_test_schema,
+    ]:
+        ctx._schemas.append(schema)
 
 
-def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
+def test_init_project(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
     if ctx.test_type != "query":
         pytest.skip("Init example project end-to-end tests only need to run for query")
 
-    state_schema = "sqlmesh"
+    tmp_path = tmp_path_factory.mktemp(f"init_project_{ctx.test_id}")
+
+    schema_name = ctx.add_test_suffix(TEST_SCHEMA)
+    state_schema = ctx.add_test_suffix("sqlmesh_state")
+
     object_names = {
-        "view_schema": ["sqlmesh_example"],
-        "physical_schema": ["sqlmesh__sqlmesh_example"],
-        "dev_schema": ["sqlmesh_example__test_dev"],
+        "view_schema": [schema_name],
+        "physical_schema": [f"sqlmesh__{schema_name}"],
+        "dev_schema": [f"{schema_name}__test_dev"],
         "views": ["full_model", "incremental_model", "seed_model"],
     }
 
@@ -1691,7 +1722,8 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
             k: [_normalize_snowflake(name) for name in v] for k, v in object_names.items()
         }
 
-    init_example_project(tmp_path, ctx.dialect)
+    init_example_project(tmp_path, ctx.dialect, schema_name=schema_name)
+
     config = load_config_from_paths(
         Config,
         project_paths=[
@@ -1699,15 +1731,23 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
         ],
         personal_paths=[pathlib.Path("~/.sqlmesh/config.yaml").expanduser()],
     )
+
     # ensure default dialect comes from init_example_project and not ~/.sqlmesh/config.yaml
     if config.model_defaults.dialect != ctx.dialect:
         config.model_defaults = config.model_defaults.copy(update={"dialect": ctx.dialect})
 
+    # To enable parallelism in integration tests
+    config.gateways = {ctx.gateway: config.gateways[ctx.gateway]}
+    current_gateway_config = config.gateways[ctx.gateway]
+
     if ctx.dialect == "athena":
         # Ensure that this test is using the same s3_warehouse_location as TestContext (which includes the testrun_id)
-        config.gateways[
-            ctx.gateway
-        ].connection.s3_warehouse_location = ctx.engine_adapter.s3_warehouse_location
+        current_gateway_config.connection.s3_warehouse_location = (
+            ctx.engine_adapter.s3_warehouse_location
+        )
+
+    # Ensure the state schema is unique to this test
+    config.gateways[ctx.gateway].state_schema = state_schema
 
     context = Context(paths=tmp_path, config=config, gateway=ctx.gateway)
     ctx.engine_adapter = context.engine_adapter
@@ -1722,15 +1762,6 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
                 )
         context._models.update(replacement_models)
 
-    # clean up any leftover schemas from previous runs (requires context)
-    for schema in [
-        state_schema,
-        *object_names["view_schema"],
-        *object_names["physical_schema"],
-        *object_names["dev_schema"],
-    ]:
-        context.engine_adapter.drop_schema(schema, ignore_if_not_exists=True, cascade=True)
-
     # apply prod plan
     context.plan(auto_apply=True, no_prompts=True)
 
@@ -1742,15 +1773,14 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
     physical_layer_results = ctx.get_metadata_results(object_names["physical_schema"][0])
     assert len(physical_layer_results.views) == 0
     assert len(physical_layer_results.materialized_views) == 0
-    assert len(physical_layer_results.tables) == len(physical_layer_results.non_temp_tables) == 6
+    assert len(physical_layer_results.tables) == len(physical_layer_results.non_temp_tables) == 3
 
     # make and validate unmodified dev environment
-    no_change_plan: Plan = context.plan(
+    no_change_plan: Plan = context.plan_builder(
         environment="test_dev",
         skip_tests=True,
-        no_prompts=True,
         include_unmodified=True,
-    )
+    ).build()
     assert not no_change_plan.requires_backfill
     assert no_change_plan.context_diff.is_new_environment
 
@@ -1765,6 +1795,15 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
     assert sorted(dev_schema_results.views) == object_names["views"]
     assert len(dev_schema_results.materialized_views) == 0
     assert len(dev_schema_results.tables) == len(dev_schema_results.non_temp_tables) == 0
+
+    # register the schemas to be cleaned up
+    for schema in [
+        state_schema,
+        *object_names["view_schema"],
+        *object_names["physical_schema"],
+        *object_names["dev_schema"],
+    ]:
+        ctx._schemas.append(schema)
 
 
 def test_dialects(ctx: TestContext):
@@ -1825,7 +1864,7 @@ def test_dialects(ctx: TestContext):
     [
         (
             exp.null(),
-            exp.DataType.build("TIMESTAMP"),
+            exp.DataType.build("TIMESTAMP", nullable=True),
             None,
             {
                 "default": None,
@@ -1900,7 +1939,7 @@ def test_to_time_column(
         time_column = re.match(r"^(.*?)\+", time_column).group(1)
         time_column_type = exp.DataType.build("TIMESTAMP('UTC')", dialect="clickhouse")
 
-    time_column = to_time_column(time_column, time_column_type, time_column_format)
+    time_column = to_time_column(time_column, time_column_type, ctx.dialect, time_column_format)
     df = ctx.engine_adapter.fetchdf(exp.select(time_column).as_("the_col"))
     expected = result.get(ctx.dialect, result.get("default"))
     col_name = "THE_COL" if ctx.dialect == "snowflake" else "the_col"
@@ -2080,6 +2119,7 @@ def test_managed_model_upstream_forward_only(ctx: TestContext):
     assert plan_1.snapshot_for(model_b).model.view_name in plan_1.schema_metadata.views
 
     assert len(plan_1.internal_schema_metadata.tables) == 3
+
     assert plan_1.table_name_for(model_a) in plan_1.internal_schema_metadata.tables
     assert plan_1.dev_table_name_for(model_a) in plan_1.internal_schema_metadata.tables
     assert (
@@ -2202,3 +2242,416 @@ def test_managed_model_upstream_forward_only(ctx: TestContext):
         plan_4.table_name_for(model_b) not in plan_4.internal_schema_metadata.tables
     )  # however, it should be a managed table, not a normal table
     assert plan_4.table_name_for(model_b) in plan_4.internal_schema_metadata.managed_tables
+
+
+@pytest.mark.parametrize(
+    "column_type, input_data, expected_results",
+    [
+        (DATA_TYPE.BOOLEAN, (True, False, None), ("1", "0", None)),
+        (
+            DATA_TYPE.DATE,
+            (datetime(2023, 1, 1).date(), datetime(2024, 12, 15, 5, 30, 0).date(), None),
+            ("2023-01-01", "2024-12-15", None),
+        ),
+        (
+            DATA_TYPE.TIMESTAMP,
+            (
+                datetime(2023, 1, 1),
+                datetime(2023, 1, 1, 13, 14, 15),
+                datetime(2023, 1, 1, 13, 14, 15, 123456),
+                None,
+            ),
+            (
+                "2023-01-01 00:00:00.000000",
+                "2023-01-01 13:14:15.000000",
+                "2023-01-01 13:14:15.123456",
+                None,
+            ),
+        ),
+        (
+            DATA_TYPE.DATETIME,
+            (
+                datetime(2023, 1, 1),
+                datetime(2023, 1, 1, 13, 14, 15),
+                datetime(2023, 1, 1, 13, 14, 15, 123456),
+                None,
+            ),
+            (
+                "2023-01-01 00:00:00.000000",
+                "2023-01-01 13:14:15.000000",
+                "2023-01-01 13:14:15.123456",
+                None,
+            ),
+        ),
+        (
+            DATA_TYPE.TIMESTAMPTZ,
+            (
+                pytz.timezone("America/Los_Angeles").localize(datetime(2023, 1, 1)),
+                pytz.timezone("Europe/Athens").localize(datetime(2023, 1, 1, 13, 14, 15)),
+                pytz.timezone("Pacific/Auckland").localize(
+                    datetime(2023, 1, 1, 13, 14, 15, 123456)
+                ),
+                None,
+            ),
+            (
+                "2023-01-01 08:00:00.000000",
+                "2023-01-01 11:14:15.000000",
+                "2023-01-01 00:14:15.123456",
+                None,
+            ),
+        ),
+    ],
+)
+def test_value_normalization(
+    ctx: TestContext,
+    column_type: exp.DataType.Type,
+    input_data: t.Tuple[t.Any, ...],
+    expected_results: t.Tuple[str, ...],
+) -> None:
+    if ctx.test_type != "query":
+        pytest.skip("Value normalization tests only need to run for query")
+
+    if (
+        ctx.dialect == "trino"
+        and ctx.engine_adapter.current_catalog_type == "hive"
+        and column_type == exp.DataType.Type.TIMESTAMPTZ
+    ):
+        pytest.skip(
+            "Trino on Hive doesnt support creating tables with TIMESTAMP WITH TIME ZONE fields"
+        )
+
+    if not isinstance(ctx.engine_adapter, RowDiffMixin):
+        pytest.skip(
+            "Value normalization tests are only relevant for engines with row diffing implemented"
+        )
+
+    full_column_type = exp.DataType.build(column_type)
+
+    # resolve dialect-specific types
+    if column_type in (DATA_TYPE.DATETIME, DATA_TYPE.TIMESTAMP, DATA_TYPE.TIMESTAMPTZ):
+        if ctx.dialect in ("mysql", "trino"):
+            # MySQL needs DATETIME(6) instead of DATETIME or subseconds will be truncated.
+            # It also needs TIMESTAMP(6) as the column type for CREATE TABLE or the truncation will occur
+            full_column_type = exp.DataType.build(
+                column_type,
+                expressions=[
+                    exp.DataTypeParam(
+                        this=exp.Literal.number(ctx.engine_adapter.MAX_TIMESTAMP_PRECISION)
+                    )
+                ],
+            )
+    if ctx.dialect == "tsql" and column_type == exp.DataType.Type.DATETIME:
+        full_column_type = exp.DataType.build("DATETIME2", dialect="tsql")
+
+    columns_to_types = {
+        "_idx": exp.DataType.build(DATA_TYPE.INT),
+        "value": full_column_type,
+    }
+
+    input_data_with_idx = [(idx, value) for idx, value in enumerate(input_data)]
+
+    test_table = normalize_identifiers(
+        exp.to_table(ctx.table("test_value_normalization")), dialect=ctx.dialect
+    )
+    columns_to_types_normalized = {
+        normalize_identifiers(k, dialect=ctx.dialect).sql(dialect=ctx.dialect): v
+        for k, v in columns_to_types.items()
+    }
+
+    ctx.engine_adapter.create_table(
+        table_name=test_table, columns_to_types=columns_to_types_normalized
+    )
+    data_query = next(select_from_values(input_data_with_idx, columns_to_types_normalized))
+    ctx.engine_adapter.insert_append(
+        table_name=test_table,
+        query_or_df=data_query,
+        columns_to_types=columns_to_types_normalized,
+    )
+
+    query = (
+        exp.select(
+            ctx.engine_adapter.normalize_value(
+                normalize_identifiers(exp.to_column("value"), dialect=ctx.dialect),
+                columns_to_types["value"],
+                decimal_precision=3,
+                timestamp_precision=ctx.engine_adapter.MAX_TIMESTAMP_PRECISION,
+            ).as_("value")
+        )
+        .from_(test_table)
+        .order_by(normalize_identifiers("_idx", dialect=ctx.dialect))
+    )
+    result = ctx.engine_adapter.fetchdf(query, quote_identifiers=True)
+    assert len(result) == len(expected_results)
+
+    def truncate_timestamp(ts: str, precision: int) -> str:
+        if not ts:
+            return ts
+
+        digits_to_truncate = 6 - precision
+        return ts[:-digits_to_truncate] if digits_to_truncate > 0 else ts
+
+    if full_column_type.is_type(DATA_TYPE.DATETIME, DATA_TYPE.TIMESTAMP, DATA_TYPE.TIMESTAMPTZ):
+        # truncate our expected results to the engine precision
+        expected_results = tuple(
+            truncate_timestamp(e, ctx.engine_adapter.MAX_TIMESTAMP_PRECISION)
+            for e in expected_results
+        )
+
+    for idx, row in enumerate(result.itertuples(index=False)):
+        assert row.value == expected_results[idx]
+
+
+def test_table_diff_grain_check_single_key(ctx: TestContext):
+    if ctx.test_type != "query":
+        pytest.skip("table_diff tests are only relevant for query")
+
+    if not isinstance(ctx.engine_adapter, RowDiffMixin):
+        pytest.skip("table_diff tests are only relevant for engines with row diffing implemented")
+
+    src_table = ctx.table("source")
+    target_table = ctx.table("target")
+
+    columns_to_types = {"key1": exp.DataType.build("int"), "value": exp.DataType.build("varchar")}
+
+    ctx.engine_adapter.create_table(src_table, columns_to_types)
+    ctx.engine_adapter.create_table(target_table, columns_to_types)
+
+    src_data = [
+        (1, "one"),
+        (2, "two"),
+        (None, "three"),
+        (4, "four"),  # missing in target
+    ]
+
+    target_data = [
+        (1, "one"),
+        (2, "two"),
+        (None, "three"),
+        (5, "five"),  # missing in src
+        (6, "six"),  # missing in src
+    ]
+
+    ctx.engine_adapter.replace_query(
+        src_table, pd.DataFrame(src_data, columns=columns_to_types.keys()), columns_to_types
+    )
+    ctx.engine_adapter.replace_query(
+        target_table, pd.DataFrame(target_data, columns=columns_to_types.keys()), columns_to_types
+    )
+
+    table_diff = TableDiff(
+        adapter=ctx.engine_adapter,
+        source=exp.table_name(src_table),
+        target=exp.table_name(target_table),
+        on=['"key1"'],
+    )
+
+    row_diff = table_diff.row_diff()
+
+    assert row_diff.full_match_count == 2
+    assert row_diff.full_match_pct == 57.14
+    assert row_diff.s_only_count == 1
+    assert row_diff.t_only_count == 2
+    assert row_diff.stats["key1_matches"] == 4
+    assert row_diff.stats["value_matches"] == 2
+    assert row_diff.stats["join_count"] == 2
+    assert row_diff.stats["null_grain_count"] == 2
+    assert row_diff.stats["s_count"] == 3
+    assert row_diff.stats["distinct_count_s"] == 3
+    assert row_diff.stats["t_count"] == 4
+    assert row_diff.stats["distinct_count_t"] == 4
+    assert row_diff.stats["s_only_count"] == 1
+    assert row_diff.stats["t_only_count"] == 2
+    assert row_diff.s_sample.shape == (1, 2)
+    assert row_diff.t_sample.shape == (2, 2)
+
+
+def test_table_diff_grain_check_multiple_keys(ctx: TestContext):
+    if ctx.test_type != "query":
+        pytest.skip("table_diff tests are only relevant for query")
+
+    if not isinstance(ctx.engine_adapter, RowDiffMixin):
+        pytest.skip("table_diff tests are only relevant for engines with row diffing implemented")
+
+    src_table = ctx.table("source")
+    target_table = ctx.table("target")
+
+    columns_to_types = {
+        "key1": exp.DataType.build("int"),
+        "key2": exp.DataType.build("varchar"),
+        "value": exp.DataType.build("varchar"),
+    }
+
+    ctx.engine_adapter.create_table(src_table, columns_to_types)
+    ctx.engine_adapter.create_table(target_table, columns_to_types)
+
+    src_data = [
+        (1, 1, 1),
+        (7, 4, 2),
+        (None, 3, 3),
+        (None, None, 3),
+        (1, 2, 2),
+        (4, None, 3),
+        (2, 3, 2),
+    ]
+
+    target_data = src_data + [(1, 6, 1), (1, 5, 3), (None, 2, 3)]
+
+    ctx.engine_adapter.insert_append(
+        src_table, next(select_from_values(src_data, columns_to_types)), columns_to_types
+    )
+    ctx.engine_adapter.insert_append(
+        target_table, next(select_from_values(target_data, columns_to_types)), columns_to_types
+    )
+
+    table_diff = TableDiff(
+        adapter=ctx.engine_adapter,
+        source=exp.table_name(src_table),
+        target=exp.table_name(target_table),
+        on=['"key1"', '"key2"'],
+    )
+
+    row_diff = table_diff.row_diff()
+
+    assert row_diff.full_match_count == 7
+    assert row_diff.full_match_pct == 93.33
+    assert row_diff.s_only_count == 2
+    assert row_diff.t_only_count == 5
+    assert row_diff.stats["join_count"] == 4
+    assert row_diff.stats["null_grain_count"] == 4
+    assert row_diff.stats["s_count"] != row_diff.stats["distinct_count_s"]
+    assert row_diff.stats["distinct_count_s"] == 7
+    assert row_diff.stats["t_count"] != row_diff.stats["distinct_count_t"]
+    assert row_diff.stats["distinct_count_t"] == 10
+    assert row_diff.s_sample.shape == (0, 3)
+    assert row_diff.t_sample.shape == (3, 3)
+
+
+def test_table_diff_arbitrary_condition(ctx: TestContext):
+    if ctx.test_type != "query":
+        pytest.skip("table_diff tests are only relevant for query")
+
+    if not isinstance(ctx.engine_adapter, RowDiffMixin):
+        pytest.skip("table_diff tests are only relevant for engines with row diffing implemented")
+
+    src_table = ctx.table("source")
+    target_table = ctx.table("target")
+
+    columns_to_types_src = {
+        "id": exp.DataType.build("int"),
+        "value": exp.DataType.build("varchar"),
+        "ts": exp.DataType.build("timestamp"),
+    }
+
+    columns_to_types_target = {
+        "item_id": exp.DataType.build("int"),
+        "value": exp.DataType.build("varchar"),
+        "ts": exp.DataType.build("timestamp"),
+    }
+
+    ctx.engine_adapter.create_table(src_table, columns_to_types_src)
+    ctx.engine_adapter.create_table(target_table, columns_to_types_target)
+
+    src_data = [
+        (1, "one", datetime(2023, 1, 1, 12, 13, 14)),
+        (2, "two", datetime(2023, 10, 1, 8, 13, 14)),
+        (3, "three", datetime(2024, 1, 1, 8, 13, 14)),
+    ]
+
+    target_data = src_data + [(4, "four", datetime(2024, 2, 1, 8, 13, 14))]
+
+    ctx.engine_adapter.replace_query(
+        src_table, pd.DataFrame(src_data, columns=columns_to_types_src.keys()), columns_to_types_src
+    )
+    ctx.engine_adapter.replace_query(
+        target_table,
+        pd.DataFrame(target_data, columns=columns_to_types_target.keys()),
+        columns_to_types_target,
+    )
+
+    table_diff = TableDiff(
+        adapter=ctx.engine_adapter,
+        source=exp.table_name(src_table),
+        target=exp.table_name(target_table),
+        on=parse_one('"s"."id" = "t"."item_id"', into=exp.Condition),
+        where=parse_one("to_char(\"ts\", 'YYYY') = '2024'", dialect="postgres", into=exp.Condition),
+    )
+
+    row_diff = table_diff.row_diff()
+
+    assert row_diff.full_match_count == 1
+    assert row_diff.full_match_pct == 66.67
+    assert row_diff.s_only_count == 0
+    assert row_diff.t_only_count == 1
+    assert row_diff.stats["value_matches"] == 1
+    assert row_diff.stats["ts_matches"] == 1
+    assert row_diff.stats["join_count"] == 1
+    assert row_diff.stats["null_grain_count"] == 0
+    assert row_diff.stats["s_count"] == 1
+    assert row_diff.stats["distinct_count_s"] == 1
+    assert row_diff.stats["t_count"] == 2
+    assert row_diff.stats["distinct_count_t"] == 2
+    assert row_diff.stats["s_only_count"] == 0
+    assert row_diff.stats["t_only_count"] == 1
+    assert row_diff.s_sample.shape == (0, 3)
+    assert row_diff.t_sample.shape == (1, 3)
+
+
+def test_table_diff_identical_dataset(ctx: TestContext):
+    if ctx.test_type != "query":
+        pytest.skip("table_diff tests are only relevant for query")
+
+    if not isinstance(ctx.engine_adapter, RowDiffMixin):
+        pytest.skip("table_diff tests are only relevant for engines with row diffing implemented")
+
+    src_table = ctx.table("source")
+    target_table = ctx.table("target")
+
+    columns_to_types = {
+        "key1": exp.DataType.build("int"),
+        "key2": exp.DataType.build("varchar"),
+        "value": exp.DataType.build("varchar"),
+    }
+
+    ctx.engine_adapter.create_table(src_table, columns_to_types)
+    ctx.engine_adapter.create_table(target_table, columns_to_types)
+
+    src_data = [
+        (1, 1, 1),
+        (7, 4, 2),
+        (1, 2, 2),
+        (4, 1, 3),
+        (2, 3, 2),
+    ]
+
+    target_data = src_data
+
+    ctx.engine_adapter.insert_append(
+        src_table, next(select_from_values(src_data, columns_to_types)), columns_to_types
+    )
+    ctx.engine_adapter.insert_append(
+        target_table, next(select_from_values(target_data, columns_to_types)), columns_to_types
+    )
+
+    table_diff = TableDiff(
+        adapter=ctx.engine_adapter,
+        source=exp.table_name(src_table),
+        target=exp.table_name(target_table),
+        on=['"key1"', '"key2"'],
+    )
+
+    row_diff = table_diff.row_diff()
+
+    assert row_diff.full_match_count == 5
+    assert row_diff.full_match_pct == 100
+    assert row_diff.s_only_count == 0
+    assert row_diff.t_only_count == 0
+    assert row_diff.stats["join_count"] == 5
+    assert row_diff.stats["null_grain_count"] == 0
+    assert row_diff.stats["s_count"] == 5
+    assert row_diff.stats["distinct_count_s"] == 5
+    assert row_diff.stats["t_count"] == 5
+    assert row_diff.stats["distinct_count_t"] == 5
+    assert row_diff.stats["s_only_count"] == 0
+    assert row_diff.stats["t_only_count"] == 0
+    assert row_diff.s_sample.shape == (0, 3)
+    assert row_diff.t_sample.shape == (0, 3)

@@ -24,9 +24,9 @@ import sqlmesh
 %context path_to_sqlmesh_project
 ```
 
-### Quick start project
+### Quickstart project
 
-If desired, you can create the [quick start example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
+If desired, you can create the [quickstart example project](../quick_start.md) with the Python `init_example_project` function. The function requires a default SQL dialect for the project's models; this example uses `snowflake`:
 
 ```python
 from sqlmesh.cli.example_project import init_example_project
@@ -70,7 +70,7 @@ options:
 
 #### init
 ```
-%init [--template TEMPLATE] path sql_dialect
+%init [--template TEMPLATE] [--dlt-pipeline PIPELINE] path sql_dialect
 
 Creates a SQLMesh project scaffold with a default SQL dialect.
 
@@ -87,7 +87,10 @@ positional arguments:
 options:
   --template TEMPLATE, -t TEMPLATE
                         Project template. Supported values: airflow, dbt,
-                        default, empty.
+                        dlt, default, empty.
+  --dlt-pipeline PIPELINE
+                        DLT pipeline for which to generate a SQLMesh project.
+                        This option is supported if the template is dlt.
 ```
 
 #### plan
@@ -100,7 +103,7 @@ options:
             [--no-auto-categorization] [--include-unmodified]
             [--select-model [SELECT_MODEL ...]]
             [--backfill-model [BACKFILL_MODEL ...]] [--no-diff] [--run]
-            [environment]
+            [environment] [--diff-rendered]
 
 Goes through a set of prompts to both establish a plan and apply it
 
@@ -150,6 +153,8 @@ options:
   --no-diff             Hide text differences for changed models.
   --run                 Run latest intervals as part of the plan application
                         (prod environment only).
+  --diff-rendered       Output text differences for the rendered versions of models and standalone audits
+
 ```
 
 #### run_dag
@@ -227,6 +232,17 @@ options:
   --file FILE, -f FILE  An optional file path to write the HTML output to.
 ```
 
+#### dlt_refresh
+```
+%dlt_refresh PIPELINE [--table] TABLE [--force]
+
+Attaches to a DLT pipeline with the option to update specific or all models of the SQLMesh project.
+
+options:
+  --table TABLE, -t TABLE  The DLT tables to generate SQLMesh models from. When none specified, all new missing tables will be generated.
+  --force, -f              If set it will overwrite existing models with the new generated models from the DLT tables.
+```
+
 #### fetchdf
 ```
 %%fetchdf [df_var]
@@ -270,6 +286,7 @@ Create a schema file containing external model schemas.
 %table_diff [--on [ON ...]] [--skip-columns [SKIP_COLUMNS ...]]
                 [--model MODEL] [--where WHERE] [--limit LIMIT]
                 [--show-sample] [--decimals DECIMALS] [--skip-grain-check]
+                [--temp-schema SCHEMA]
                 SOURCE:TARGET
 
 Show the diff between two tables.
@@ -295,6 +312,7 @@ options:
                         floating point columns. Default: 3
   --skip-grain-check    Disable the check for a primary key (grain) that is
                         missing or is not unique.
+  --temp-schema SCHEMA  The schema to use for temporary tables.
 ```
 
 #### model
@@ -350,8 +368,9 @@ options:
 
 #### create_test
 ```
-%create_test --query QUERY [QUERY ...] [--overwrite]
+%create_test [--query QUERY [QUERY ...]] [--overwrite]
                    [--var VAR [VAR ...]] [--path PATH] [--name NAME]
+                   [--include-ctes]
                    model
 
 Generate a unit test fixture for a given model.

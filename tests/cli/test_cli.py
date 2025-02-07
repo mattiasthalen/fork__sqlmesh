@@ -1,17 +1,18 @@
 import logging
 from contextlib import contextmanager
-from os import path
+from os import getcwd, path, remove
 from pathlib import Path
-
 import pytest
 from click.testing import CliRunner
-from freezegun import freeze_time
+import time_machine
 
-from sqlmesh.cli.example_project import init_example_project
+from sqlmesh.cli.example_project import ProjectTemplate, init_example_project
 from sqlmesh.cli.main import cli
 from sqlmesh.core.context import Context
+from sqlmesh.integrations.dlt import generate_dlt_models
+from sqlmesh.utils.date import yesterday_ds
 
-FREEZE_TIME = "2023-01-01 00:00:00"
+FREEZE_TIME = "2023-01-01 00:00:00 UTC"
 
 pytestmark = pytest.mark.slow
 
@@ -49,6 +50,9 @@ default_gateway: local
 
 model_defaults:
   dialect: duckdb
+
+plan:
+  no_prompts: false
 """
         )
 
@@ -114,20 +118,24 @@ def assert_duckdb_test(result) -> None:
     assert "Successfully Ran 1 tests against duckdb" in result.output
 
 
-def assert_new_env(result, new_env="prod", from_env="prod") -> None:
-    assert f"New environment `{new_env}` will be created from `{from_env}`" in result.output
+def assert_new_env(result, new_env="prod", from_env="prod", initialize=True) -> None:
+    assert (
+        f"`{new_env}` environment will be initialized"
+        if initialize
+        else f"New environment `{new_env}` will be created from `{from_env}`"
+    ) in result.output
 
 
 def assert_model_versions_created(result) -> None:
-    assert "All model versions have been created successfully" in result.output
+    assert "Model versions created successfully" in result.output
 
 
 def assert_model_batches_executed(result) -> None:
-    assert "All model batches have been executed successfully" in result.output
+    assert "Model batches executed successfully" in result.output
 
 
 def assert_target_env_updated(result) -> None:
-    assert "The target environment has been updated successfully" in result.output
+    assert "Target environment updated successfully" in result.output
 
 
 def assert_backfill_success(result) -> None:
@@ -209,9 +217,10 @@ def test_plan_restate_model(runner, tmp_path):
     )
     assert result.exit_code == 0
     assert_duckdb_test(result)
-    assert "No differences when compared to `prod`" in result.output
+    assert "No changes to plan: project files match the `prod` environment" in result.output
     assert "sqlmesh_example.full_model evaluated in" in result.output
-    assert_backfill_success(result)
+    assert_model_batches_executed(result)
+    assert_target_env_updated(result)
 
 
 @pytest.mark.parametrize("flag", ["--skip-backfill", "--dry-run"])
@@ -235,7 +244,7 @@ def test_plan_skip_backfill(runner, tmp_path, flag):
     )
     assert result.exit_code == 0
     assert_virtual_update(result)
-    assert "All model batches have been executed successfully" not in result.output
+    assert "Model batches executed successfully" not in result.output
 
 
 def test_plan_auto_apply(runner, tmp_path):
@@ -284,8 +293,8 @@ def test_plan_dev_start_date(runner, tmp_path):
         input="\ny\n",
     )
     assert_plan_success(result, "dev")
-    assert "sqlmesh_example__dev.full_model: 2023-01-01" in result.output
-    assert "sqlmesh_example__dev.incremental_model: 2023-01-01" in result.output
+    assert "sqlmesh_example__dev.full_model: [full refresh]" in result.output
+    assert "sqlmesh_example__dev.incremental_model: [2023-01-01" in result.output
 
 
 def test_plan_dev_end_date(runner, tmp_path):
@@ -298,11 +307,11 @@ def test_plan_dev_end_date(runner, tmp_path):
         input="\ny\n",
     )
     assert_plan_success(result, "dev")
-    assert "sqlmesh_example__dev.full_model: 2020-01-01 - 2023-01-01" in result.output
-    assert "sqlmesh_example__dev.incremental_model: 2020-01-01 - 2023-01-01" in result.output
+    assert "sqlmesh_example__dev.full_model: [full refresh]" in result.output
+    assert "sqlmesh_example__dev.incremental_model: [2020-01-01 - 2023-01-01]" in result.output
 
 
-def test_plan_dev_create_from(runner, tmp_path):
+def test_plan_dev_create_from_virtual(runner, tmp_path):
     create_example_project(tmp_path)
 
     # create dev environment and backfill
@@ -338,24 +347,108 @@ def test_plan_dev_create_from(runner, tmp_path):
         input="y\n",
     )
     assert result.exit_code == 0
-    assert_new_env(result, "dev2", "dev")
-    assert_model_versions_created(result)
+    assert_new_env(result, "dev2", "dev", initialize=False)
     assert_target_env_updated(result)
     assert_virtual_update(result)
+
+
+def test_plan_dev_create_from(runner, tmp_path):
+    create_example_project(tmp_path)
+
+    # create dev environment and backfill
+    runner.invoke(
+        cli,
+        [
+            "--log-file-dir",
+            tmp_path,
+            "--paths",
+            tmp_path,
+            "plan",
+            "dev",
+            "--no-prompts",
+            "--auto-apply",
+        ],
+    )
+    # make model change
+    update_incremental_model(tmp_path)
+
+    # create dev2 environment from dev
+    result = runner.invoke(
+        cli,
+        [
+            "--log-file-dir",
+            tmp_path,
+            "--paths",
+            tmp_path,
+            "plan",
+            "dev2",
+            "--create-from",
+            "dev",
+            "--no-prompts",
+            "--auto-apply",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert_new_env(result, "dev2", "dev", initialize=False)
+    assert "Differences from the `dev` environment:" in result.output
+
+
+def test_plan_dev_bad_create_from(runner, tmp_path):
+    create_example_project(tmp_path)
+
+    # create dev environment and backfill
+    runner.invoke(
+        cli,
+        [
+            "--log-file-dir",
+            tmp_path,
+            "--paths",
+            tmp_path,
+            "plan",
+            "dev",
+            "--no-prompts",
+            "--auto-apply",
+        ],
+    )
+    # make model change
+    update_incremental_model(tmp_path)
+
+    # create dev2 environment from non-existent dev3
+    result = runner.invoke(
+        cli,
+        [
+            "--log-file-dir",
+            tmp_path,
+            "--paths",
+            tmp_path,
+            "plan",
+            "dev2",
+            "--create-from",
+            "dev3",
+            "--no-prompts",
+            "--auto-apply",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert_new_env(result, "dev2", "dev")
+    assert (
+        "The environment name 'dev3' was passed to the `plan` command's `--create-from` argument, but 'dev3' does not exist. Initializing new environment 'dev2' from scratch."
+        in result.output.replace("\n", "")
+    )
 
 
 def test_plan_dev_no_prompts(runner, tmp_path):
     create_example_project(tmp_path)
 
-    # plan for non-prod environment doesn't prompt to apply and doesn't
-    # backfill if only `--no-prompts` is passed
+    # plan for non-prod environment doesn't prompt for dates but prompts to apply
     result = runner.invoke(
         cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan", "dev", "--no-prompts"]
     )
-    assert result.exit_code == 0
-    assert "Apply - Backfill Tables [y/n]: " not in result.output
-    assert "All model versions have been created successfully" not in result.output
-    assert "All model batches have been executed successfully" not in result.output
+    assert "Apply - Backfill Tables [y/n]: " in result.output
+    assert "Model versions created successfully" not in result.output
+    assert "Model batches executed successfully" not in result.output
     assert "The target environment has been updated successfully" not in result.output
 
 
@@ -379,7 +472,7 @@ def test_plan_dev_no_changes(runner, tmp_path):
     result = runner.invoke(cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan", "dev"])
     assert result.exit_code == 1
     assert (
-        "Error: No changes were detected. Make a change or run with --include-unmodified"
+        "Error: Creating a new environment requires a change, but project files match the `prod` environment. Make a change or use the --include-unmodified flag to create a new environment without changes."
         in result.output
     )
 
@@ -391,7 +484,7 @@ def test_plan_dev_no_changes(runner, tmp_path):
         input="y\n",
     )
     assert result.exit_code == 0
-    assert_new_env(result, "dev")
+    assert_new_env(result, "dev", initialize=False)
     assert_target_env_updated(result)
     assert_virtual_update(result)
 
@@ -407,7 +500,7 @@ def test_plan_nonbreaking(runner, tmp_path):
         cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan"], input="y\n"
     )
     assert result.exit_code == 0
-    assert "Summary of differences against `prod`" in result.output
+    assert "Differences from the `prod` environment" in result.output
     assert "+  'a' AS new_col" in result.output
     assert "Directly Modified: sqlmesh_example.incremental_model (Non-breaking)" in result.output
     assert "sqlmesh_example.full_model (Indirect Non-breaking)" in result.output
@@ -538,7 +631,7 @@ def test_plan_dev_backfill(runner, tmp_path):
         input="\n\ny\n",
     )
     assert result.exit_code == 0
-    assert_new_env(result, "dev")
+    assert_new_env(result, "dev", initialize=False)
     # both model diffs present
     assert "+  item_id + 1 AS item_id," in result.output
     assert "Directly Modified: sqlmesh_example__dev.full_model (Breaking)" in result.output
@@ -562,7 +655,7 @@ def test_run_no_prod(runner, tmp_path):
 
 
 @pytest.mark.parametrize("flag", ["--skip-backfill", "--dry-run"])
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_run_dev(runner, tmp_path, flag):
     create_example_project(tmp_path)
 
@@ -580,27 +673,32 @@ def test_run_dev(runner, tmp_path, flag):
     assert_model_batches_executed(result)
 
 
-@freeze_time(FREEZE_TIME)
+@time_machine.travel(FREEZE_TIME)
 def test_run_cron_not_elapsed(runner, tmp_path, caplog):
     create_example_project(tmp_path)
     init_prod_and_backfill(runner, tmp_path)
 
-    # No error and no output if `prod` environment exists and cron has not elapsed
+    # No error if `prod` environment exists and cron has not elapsed
     with disable_logging():
         result = runner.invoke(cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "run"])
     assert result.exit_code == 0
-    assert result.output.strip() == "Run finished for environment 'prod'"
+
+    assert (
+        "No models are ready to run. Please wait until a model `cron` interval has \nelapsed.\n\nNext run will be ready at "
+        in result.output.strip()
+    )
 
 
 def test_run_cron_elapsed(runner, tmp_path):
     create_example_project(tmp_path)
 
     # Create and backfill `prod` environment
-    with freeze_time("2023-01-01 23:59:00"):
+    with time_machine.travel("2023-01-01 23:59:00 UTC", tick=False) as traveler:
+        runner = CliRunner()
         init_prod_and_backfill(runner, tmp_path)
 
-    # Run `prod` environment with daily cron elapsed
-    with freeze_time("2023-01-02 00:01:00"):
+        # Run `prod` environment with daily cron elapsed
+        traveler.move_to("2023-01-02 00:01:00 UTC")
         result = runner.invoke(cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "run"])
 
     assert result.exit_code == 0
@@ -660,3 +758,215 @@ def test_info_on_new_project_does_not_create_state_sync(runner, tmp_path):
     assert not context.engine_adapter.table_exists("sqlmesh._intervals")
     assert not context.engine_adapter.table_exists("sqlmesh._plan_dags")
     assert not context.engine_adapter.table_exists("sqlmesh._versions")
+
+
+def test_dlt_pipeline_errors(runner, tmp_path):
+    # Error if no pipeline is provided
+    result = runner.invoke(cli, ["--paths", tmp_path, "init", "-t", "dlt", "duckdb"])
+    assert (
+        "Error: DLT pipeline is a required argument to generate a SQLMesh project from DLT"
+        in result.output
+    )
+
+    # Error if the pipeline provided is not correct
+    result = runner.invoke(
+        cli,
+        ["--paths", tmp_path, "init", "-t", "dlt", "--dlt-pipeline", "missing_pipeline", "duckdb"],
+    )
+    assert "Error: Could not attach to pipeline" in result.output
+
+
+@time_machine.travel(FREEZE_TIME)
+def test_plan_dlt(runner, tmp_path):
+    root_dir = path.abspath(getcwd())
+    pipeline_path = root_dir + "/examples/sushi_dlt/sushi_pipeline.py"
+    dataset_path = root_dir + "/sushi.duckdb"
+
+    if path.exists(dataset_path):
+        remove(dataset_path)
+
+    with open(pipeline_path) as file:
+        exec(file.read())
+
+    init_example_project(tmp_path, "duckdb", ProjectTemplate.DLT, "sushi")
+
+    expected_config = f"""gateways:
+  duckdb:
+    connection:
+      type: duckdb
+      database: {dataset_path}
+
+default_gateway: duckdb
+
+model_defaults:
+  dialect: duckdb
+  start: {yesterday_ds()}
+"""
+
+    with open(tmp_path / "config.yaml") as file:
+        config = file.read()
+
+    expected_incremental_model = """MODEL (
+  name sushi_dataset_sqlmesh.incremental_sushi_types,
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column _dlt_load_time,
+  ),
+  grain (id),
+);
+
+SELECT
+  CAST(c.id AS BIGINT) AS id,
+  CAST(c.name AS TEXT) AS name,
+  CAST(c._dlt_load_id AS TEXT) AS _dlt_load_id,
+  CAST(c._dlt_id AS TEXT) AS _dlt_id,
+  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) as _dlt_load_time
+FROM
+  sushi_dataset.sushi_types as c
+WHERE
+  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+"""
+
+    dlt_sushi_types_model_path = tmp_path / "models/incremental_sushi_types.sql"
+    dlt_loads_model_path = tmp_path / "models/incremental__dlt_loads.sql"
+    dlt_waiters_model_path = tmp_path / "models/incremental_waiters.sql"
+    dlt_sushi_fillings_model_path = tmp_path / "models/incremental_sushi_menu__fillings.sql"
+    dlt_sushi_twice_nested_model_path = (
+        tmp_path / "models/incremental_sushi_menu__details__ingredients.sql"
+    )
+
+    with open(dlt_sushi_types_model_path) as file:
+        incremental_model = file.read()
+
+    expected_dlt_loads_model = """MODEL (
+  name sushi_dataset_sqlmesh.incremental__dlt_loads,
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column _dlt_load_time,
+  ),
+);
+
+SELECT
+  CAST(c.load_id AS TEXT) AS load_id,
+  CAST(c.schema_name AS TEXT) AS schema_name,
+  CAST(c.status AS BIGINT) AS status,
+  CAST(c.inserted_at AS TIMESTAMP) AS inserted_at,
+  CAST(c.schema_version_hash AS TEXT) AS schema_version_hash,
+  TO_TIMESTAMP(CAST(c.load_id AS DOUBLE)) as _dlt_load_time
+FROM
+  sushi_dataset._dlt_loads as c
+WHERE
+  TO_TIMESTAMP(CAST(c.load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+"""
+
+    with open(dlt_loads_model_path) as file:
+        dlt_loads_model = file.read()
+
+    expected_nested_fillings_model = """MODEL (
+  name sushi_dataset_sqlmesh.incremental_sushi_menu__fillings,
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column _dlt_load_time,
+  ),
+);
+
+SELECT
+  CAST(c.value AS TEXT) AS value,
+  CAST(c._dlt_root_id AS TEXT) AS _dlt_root_id,
+  CAST(c._dlt_parent_id AS TEXT) AS _dlt_parent_id,
+  CAST(c._dlt_list_idx AS BIGINT) AS _dlt_list_idx,
+  CAST(c._dlt_id AS TEXT) AS _dlt_id,
+  TO_TIMESTAMP(CAST(p._dlt_load_id AS DOUBLE)) as _dlt_load_time
+FROM
+  sushi_dataset.sushi_menu__fillings as c
+JOIN
+  sushi_dataset.sushi_menu as p
+ON
+  c._dlt_parent_id = p._dlt_id
+WHERE
+  TO_TIMESTAMP(CAST(p._dlt_load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+"""
+
+    with open(dlt_sushi_fillings_model_path) as file:
+        nested_model = file.read()
+
+    # Validate generated config and models
+    assert config == expected_config
+    assert dlt_loads_model_path.exists()
+    assert dlt_sushi_types_model_path.exists()
+    assert dlt_waiters_model_path.exists()
+    assert dlt_sushi_fillings_model_path.exists()
+    assert dlt_sushi_twice_nested_model_path.exists()
+    assert dlt_loads_model == expected_dlt_loads_model
+    assert incremental_model == expected_incremental_model
+    assert nested_model == expected_nested_fillings_model
+
+    try:
+        # Plan prod and backfill
+        result = runner.invoke(
+            cli, ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan", "--auto-apply"]
+        )
+
+        assert result.exit_code == 0
+        assert_backfill_success(result)
+
+        # Remove and update with missing model
+        remove(dlt_waiters_model_path)
+        assert not dlt_waiters_model_path.exists()
+
+        # Update with force = False will generate only the missing model
+        context = Context(paths=tmp_path)
+        assert generate_dlt_models(context, "sushi", [], False) == [
+            "sushi_dataset_sqlmesh.incremental_waiters"
+        ]
+        assert dlt_waiters_model_path.exists()
+
+        # Remove all models
+        remove(dlt_waiters_model_path)
+        remove(dlt_loads_model_path)
+        remove(dlt_sushi_types_model_path)
+        remove(dlt_sushi_fillings_model_path)
+        remove(dlt_sushi_twice_nested_model_path)
+
+        # Update to generate a specific model: sushi_types
+        assert generate_dlt_models(context, "sushi", ["sushi_types"], False) == [
+            "sushi_dataset_sqlmesh.incremental_sushi_types"
+        ]
+
+        # Only the sushi_types should be generated now
+        assert not dlt_waiters_model_path.exists()
+        assert not dlt_loads_model_path.exists()
+        assert not dlt_sushi_fillings_model_path.exists()
+        assert not dlt_sushi_twice_nested_model_path.exists()
+        assert dlt_sushi_types_model_path.exists()
+
+        # Update with force = True will generate all models and overwrite existing ones
+        generate_dlt_models(context, "sushi", [], True)
+        assert dlt_loads_model_path.exists()
+        assert dlt_sushi_types_model_path.exists()
+        assert dlt_waiters_model_path.exists()
+        assert dlt_sushi_fillings_model_path.exists()
+        assert dlt_sushi_twice_nested_model_path.exists()
+    finally:
+        remove(dataset_path)
+
+
+@time_machine.travel(FREEZE_TIME)
+def test_init_project_dialects(tmp_path):
+    dialect_to_config = {
+        "redshift": "# concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # user: \n      # password: \n      # database: \n      # host: \n      # port: \n      # source_address: \n      # unix_sock: \n      # ssl: \n      # sslmode: \n      # timeout: \n      # tcp_keepalive: \n      # application_name: \n      # preferred_role: \n      # principal_arn: \n      # credentials_provider: \n      # region: \n      # cluster_identifier: \n      # iam: \n      # is_serverless: \n      # serverless_acct_id: \n      # serverless_work_group: ",
+        "bigquery": "# concurrent_tasks: 1\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # method: oauth\n      # project: \n      # execution_project: \n      # quota_project: \n      # location: \n      # keyfile: \n      # keyfile_json: \n      # token: \n      # refresh_token: \n      # client_id: \n      # client_secret: \n      # token_uri: \n      # scopes: \n      # job_creation_timeout_seconds: \n      # job_execution_timeout_seconds: \n      # job_retries: 1\n      # job_retry_deadline_seconds: \n      # priority: \n      # maximum_bytes_billed: ",
+        "snowflake": "account: \n      # concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # user: \n      # password: \n      # warehouse: \n      # database: \n      # role: \n      # authenticator: \n      # token: \n      # application: Tobiko_SQLMesh\n      # private_key: \n      # private_key_path: \n      # private_key_passphrase: \n      # session_parameters: ",
+        "databricks": "# concurrent_tasks: 1\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # server_hostname: \n      # http_path: \n      # access_token: \n      # auth_type: \n      # oauth_client_id: \n      # oauth_client_secret: \n      # catalog: \n      # http_headers: \n      # session_configuration: \n      # databricks_connect_server_hostname: \n      # databricks_connect_access_token: \n      # databricks_connect_cluster_id: \n      # databricks_connect_use_serverless: False\n      # force_databricks_connect: False\n      # disable_databricks_connect: False\n      # disable_spark_session: False",
+        "postgres": "host: \n      user: \n      password: \n      port: \n      database: \n      # concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: True\n      # pretty_sql: False\n      # keepalives_idle: \n      # connect_timeout: 10\n      # role: \n      # sslmode: ",
+    }
+
+    for dialect, expected_config in dialect_to_config.items():
+        init_example_project(tmp_path, dialect=dialect)
+
+        config_start = f"gateways:\n  {dialect}:\n    connection:\n      # For more information on configuring the connection to your execution engine, visit:\n      # https://sqlmesh.readthedocs.io/en/stable/reference/configuration/#connections\n      # https://sqlmesh.readthedocs.io/en/stable/integrations/engines/{dialect}/#connection-options\n      type: {dialect}\n      "
+        config_end = f"\n\n\ndefault_gateway: {dialect}\n\nmodel_defaults:\n  dialect: {dialect}\n  start: {yesterday_ds()}\n"
+
+        with open(tmp_path / "config.yaml") as file:
+            config = file.read()
+
+            assert config == f"{config_start}{expected_config}{config_end}"
+
+            remove(tmp_path / "config.yaml")

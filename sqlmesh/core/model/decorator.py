@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import typing as t
 from pathlib import Path
 import inspect
@@ -25,7 +24,8 @@ from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.metaprogramming import build_env, serialize_env
 
 
-logger = logging.getLogger(__name__)
+if t.TYPE_CHECKING:
+    from sqlmesh.core.audit import ModelAudit
 
 
 class model(registry_decorator):
@@ -68,7 +68,9 @@ class model(registry_decorator):
             column_name: (
                 column_type
                 if isinstance(column_type, exp.DataType)
-                else exp.DataType.build(str(column_type))
+                else exp.DataType.build(
+                    str(column_type), dialect=self.kwargs.get("dialect", self._dialect)
+                )
             )
             for column_name, column_type in self.kwargs.pop("columns", {}).items()
         }
@@ -81,6 +83,7 @@ class model(registry_decorator):
         defaults: t.Optional[t.Dict[str, t.Any]] = None,
         macros: t.Optional[MacroRegistry] = None,
         jinja_macros: t.Optional[JinjaMacroRegistry] = None,
+        audit_definitions: t.Optional[t.Dict[str, ModelAudit]] = None,
         dialect: t.Optional[str] = None,
         time_column_format: str = c.DEFAULT_TIME_COLUMN_FORMAT,
         physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
@@ -102,7 +105,9 @@ class model(registry_decorator):
         kind = self.kwargs.get("kind", None)
         if kind is not None:
             if isinstance(kind, _ModelKind):
-                logger.warning(
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
                     f"""Python model "{self.name}"'s `kind` argument was passed a SQLMesh `{type(kind).__name__}` object. This may result in unexpected behavior - provide a dictionary instead."""
                 )
             elif isinstance(kind, dict):
@@ -113,41 +118,33 @@ class model(registry_decorator):
 
         build_env(self.func, env=env, name=entrypoint, path=module_path)
 
-        common_kwargs = dict(
-            defaults=defaults,
-            path=path,
-            time_column_format=time_column_format,
-            python_env=serialize_env(env, path=module_path),
-            physical_schema_mapping=physical_schema_mapping,
-            project=project,
-            default_catalog=default_catalog,
-            variables=variables,
+        common_kwargs = {
+            "defaults": defaults,
+            "path": path,
+            "time_column_format": time_column_format,
+            "python_env": serialize_env(env, path=module_path),
+            "physical_schema_mapping": physical_schema_mapping,
+            "project": project,
+            "default_catalog": default_catalog,
+            "variables": variables,
+            "dialect": dialect,
+            "columns": self.columns if self.columns else None,
+            "module_path": module_path,
+            "macros": macros,
+            "jinja_macros": jinja_macros,
+            "audit_definitions": audit_definitions,
             **self.kwargs,
-        )
+        }
 
-        dialect = common_kwargs.pop("dialect", dialect)
-        for key in ("pre_statements", "post_statements"):
+        for key in ("pre_statements", "post_statements", "on_virtual_update"):
             statements = common_kwargs.get(key)
             if statements:
                 common_kwargs[key] = [
-                    parse_one(s, dialect=dialect) if isinstance(s, str) else s for s in statements
+                    parse_one(s, dialect=common_kwargs.get("dialect")) if isinstance(s, str) else s
+                    for s in statements
                 ]
 
         if self.is_sql:
             query = MacroFunc(this=exp.Anonymous(this=entrypoint))
-            if self.columns:
-                common_kwargs["columns"] = self.columns
-            return create_sql_model(
-                self.name, query, module_path=module_path, dialect=dialect, **common_kwargs
-            )
-
-        return create_python_model(
-            self.name,
-            entrypoint,
-            module_path=module_path,
-            macros=macros,
-            jinja_macros=jinja_macros,
-            columns=self.columns,
-            dialect=dialect,
-            **common_kwargs,
-        )
+            return create_sql_model(self.name, query, **common_kwargs)
+        return create_python_model(self.name, entrypoint, **common_kwargs)

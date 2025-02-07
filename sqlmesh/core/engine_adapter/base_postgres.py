@@ -22,11 +22,15 @@ if t.TYPE_CHECKING:
 
 class BasePostgresEngineAdapter(EngineAdapter):
     DEFAULT_BATCH_SIZE = 400
-    CATALOG_SUPPORT = CatalogSupport.SINGLE_CATALOG_ONLY
     COMMENT_CREATION_TABLE = CommentCreationTable.COMMENT_COMMAND_ONLY
     COMMENT_CREATION_VIEW = CommentCreationView.COMMENT_COMMAND_ONLY
 
-    def _columns_query(self, table: exp.Table) -> exp.Select:
+    def columns(
+        self, table_name: TableName, include_pseudo_columns: bool = False
+    ) -> t.Dict[str, exp.DataType]:
+        """Fetches column names and types for the target table."""
+        table = exp.to_table(table_name)
+
         sql = (
             exp.select(
                 "attname AS column_name",
@@ -45,14 +49,8 @@ class BasePostgresEngineAdapter(EngineAdapter):
         )
         if table.args.get("db"):
             sql = sql.where(exp.column("nspname").eq(table.args["db"].name))
-        return sql
 
-    def columns(
-        self, table_name: TableName, include_pseudo_columns: bool = False
-    ) -> t.Dict[str, exp.DataType]:
-        """Fetches column names and types for the target table."""
-        table = exp.to_table(table_name)
-        self.execute(self._columns_query(table))
+        self.execute(sql)
         resp = self.cursor.fetchall()
         if not resp:
             raise SQLMeshError("Could not get columns for table '%s'. Table not found.", table_name)
@@ -60,6 +58,10 @@ class BasePostgresEngineAdapter(EngineAdapter):
             column_name: exp.DataType.build(data_type, dialect=self.dialect, udt=True)
             for column_name, data_type in resp
         }
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.SINGLE_CATALOG_ONLY
 
     def table_exists(self, table_name: TableName) -> bool:
         """

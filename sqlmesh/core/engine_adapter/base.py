@@ -43,12 +43,17 @@ from sqlmesh.core.schema_diff import SchemaDiffer
 from sqlmesh.utils import columns_to_types_all_known, random_id
 from sqlmesh.utils.connection_pool import create_connection_pool
 from sqlmesh.utils.date import TimeLike, make_inclusive, to_time_column
-from sqlmesh.utils.errors import SQLMeshError, UnsupportedCatalogOperationError
+from sqlmesh.utils.errors import (
+    SQLMeshError,
+    UnsupportedCatalogOperationError,
+    MissingDefaultCatalogError,
+)
 from sqlmesh.utils.pandas import columns_to_types_from_df
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, SessionProperties, TableName
     from sqlmesh.core.engine_adapter._typing import (
+        BigframeSession,
         DF,
         PySparkDataFrame,
         PySparkSession,
@@ -62,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 MERGE_TARGET_ALIAS = "__MERGE_TARGET__"
 MERGE_SOURCE_ALIAS = "__MERGE_SOURCE__"
+
+KEY_FOR_CREATABLE_TYPE = "CREATABLE_TYPE"
 
 
 @set_catalog()
@@ -95,7 +102,6 @@ class EngineAdapter:
     SUPPORTS_MANAGED_MODELS = False
     SCHEMA_DIFFER = SchemaDiffer()
     SUPPORTS_TUPLE_IN = True
-    CATALOG_SUPPORT = CatalogSupport.UNSUPPORTED
     HAS_VIEW_BINDING = False
     SUPPORTS_REPLACE_TABLE = True
     DEFAULT_CATALOG_TYPE = DIALECT
@@ -107,17 +113,17 @@ class EngineAdapter:
         dialect: str = "",
         sql_gen_kwargs: t.Optional[t.Dict[str, Dialect | bool | str]] = None,
         multithreaded: bool = False,
-        cursor_kwargs: t.Optional[t.Dict[str, t.Any]] = None,
         cursor_init: t.Optional[t.Callable[[t.Any], None]] = None,
         default_catalog: t.Optional[str] = None,
         execute_log_level: int = logging.DEBUG,
         register_comments: bool = True,
         pre_ping: bool = False,
+        pretty_sql: bool = False,
         **kwargs: t.Any,
     ):
         self.dialect = dialect.lower() or self.DIALECT
         self._connection_pool = create_connection_pool(
-            connection_factory, multithreaded, cursor_kwargs=cursor_kwargs, cursor_init=cursor_init
+            connection_factory, multithreaded, cursor_init=cursor_init
         )
         self._sql_gen_kwargs = sql_gen_kwargs or {}
         self._default_catalog = default_catalog
@@ -125,6 +131,7 @@ class EngineAdapter:
         self._extra_config = kwargs
         self._register_comments = register_comments
         self._pre_ping = pre_ping
+        self._pretty_sql = pretty_sql
 
     def with_log_level(self, level: int) -> EngineAdapter:
         adapter = self.__class__(
@@ -158,8 +165,16 @@ class EngineAdapter:
         return None
 
     @property
+    def bigframe(self) -> t.Optional[BigframeSession]:
+        return None
+
+    @property
     def comments_enabled(self) -> bool:
         return self._register_comments and self.COMMENT_CREATION_TABLE.is_supported
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.UNSUPPORTED
 
     @classmethod
     def _casted_columns(cls, columns_to_types: t.Dict[str, exp.DataType]) -> t.List[exp.Alias]:
@@ -170,11 +185,13 @@ class EngineAdapter:
 
     @property
     def default_catalog(self) -> t.Optional[str]:
-        if self.CATALOG_SUPPORT.is_unsupported:
+        if self.catalog_support.is_unsupported:
             return None
         default_catalog = self._default_catalog or self.get_current_catalog()
         if not default_catalog:
-            raise SQLMeshError("Could not determine a default catalog despite it being supported.")
+            raise MissingDefaultCatalogError(
+                "Could not determine a default catalog despite it being supported."
+            )
         return default_catalog
 
     @property
@@ -289,7 +306,7 @@ class EngineAdapter:
         """Intended to be overridden for data virtualization systems like Trino that,
         depending on the target catalog, require slightly different properties to be set when creating / updating tables
         """
-        if self.CATALOG_SUPPORT.is_unsupported:
+        if self.catalog_support.is_unsupported:
             raise UnsupportedCatalogOperationError(
                 f"{self.dialect} does not support catalogs and a catalog was provided: {catalog}"
             )
@@ -337,6 +354,7 @@ class EngineAdapter:
                 exists=True,
                 table_description=table_description,
                 column_descriptions=column_descriptions,
+                **kwargs,
             )
         # All engines support `CREATE TABLE AS` so we use that if the table doesn't already exist and we
         # use `CREATE OR REPLACE TABLE AS` if the engine supports it
@@ -407,6 +425,33 @@ class EngineAdapter:
         )
         self.execute(expression)
 
+    def _pop_creatable_type_from_properties(
+        self,
+        properties: t.Dict[str, exp.Expression],
+    ) -> t.Optional[exp.Property]:
+        """Pop out the creatable_type from the properties dictionary (if exists (return it/remove it) else return none).
+        It also checks that none of the expressions are MATERIALIZE as that conflicts with the `materialize` parameter.
+        """
+        for key in list(properties.keys()):
+            upper_key = key.upper()
+            if upper_key == KEY_FOR_CREATABLE_TYPE:
+                value = properties.pop(key).name
+                parsed_properties = exp.maybe_parse(
+                    value, into=exp.Properties, dialect=self.dialect
+                )
+                property, *others = parsed_properties.expressions
+                if others:
+                    # Multiple properties are unsupported today, can look into it in the future if needed
+                    raise SQLMeshError(
+                        f"Invalid creatable_type value with multiple properties: {value}"
+                    )
+                if isinstance(property, exp.MaterializedProperty):
+                    raise SQLMeshError(
+                        f"Cannot use {value} as a creatable_type as it conflicts with the `materialize` parameter."
+                    )
+                return property
+        return None
+
     def create_table(
         self,
         table_name: TableName,
@@ -444,7 +489,7 @@ class EngineAdapter:
         query: Query,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
@@ -459,7 +504,7 @@ class EngineAdapter:
             query: The SQL query for the engine to base the managed table on
             columns_to_types: A mapping between the column name and its data type.
             partitioned_by: The partition columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
-            clustered_by: The cluster columns, only applicable in certain engines. (eg. (ds, hour))
+            clustered_by: The cluster columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
             table_properties: Optional mapping of engine-specific properties to be set on the managed table
             table_description: Optional table description from MODEL DDL.
             column_descriptions: Optional column descriptions from model query.
@@ -951,6 +996,11 @@ class EngineAdapter:
         if not properties:
             properties = exp.Properties(expressions=[])
 
+        if view_properties:
+            table_type = self._pop_creatable_type_from_properties(view_properties)
+            if table_type:
+                properties.append("expressions", table_type)
+
         if materialized and self.SUPPORTS_MATERIALIZED_VIEWS:
             properties.append("expressions", exp.MaterializedProperty())
 
@@ -988,7 +1038,11 @@ class EngineAdapter:
         )
         if create_view_properties:
             for view_property in create_view_properties.expressions:
-                properties.append("expressions", view_property)
+                # Small hack to make sure SECURE goes at the beginning before materialized as required by Snowflake
+                if isinstance(view_property, exp.SecureProperty):
+                    properties.set("expressions", view_property, index=0, overwrite=False)
+                else:
+                    properties.append("expressions", view_property)
 
         if properties.expressions:
             create_kwargs["properties"] = properties
@@ -1199,7 +1253,9 @@ class EngineAdapter:
         )
         if not columns_to_types or not columns_to_types_all_known(columns_to_types):
             columns_to_types = self.columns(table_name)
-        low, high = [time_formatter(dt, columns_to_types) for dt in make_inclusive(start, end)]
+        low, high = [
+            time_formatter(dt, columns_to_types) for dt in make_inclusive(start, end, self.dialect)
+        ]
         if isinstance(time_column, TimeColumn):
             time_column = time_column.column
         where = exp.Between(
@@ -1246,6 +1302,7 @@ class EngineAdapter:
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         where: t.Optional[exp.Condition] = None,
         insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
+        **kwargs: t.Any,
     ) -> None:
         table = exp.to_table(table_name)
         insert_overwrite_strategy = (
@@ -1295,20 +1352,13 @@ class EngineAdapter:
         target_table: TableName,
         query: Query,
         on: exp.Expression,
-        match_expressions: t.List[exp.When],
+        whens: exp.Whens,
     ) -> None:
         this = exp.alias_(exp.to_table(target_table), alias=MERGE_TARGET_ALIAS, table=True)
         using = exp.alias_(
             exp.Subquery(this=query), alias=MERGE_SOURCE_ALIAS, copy=False, table=True
         )
-        self.execute(
-            exp.Merge(
-                this=this,
-                using=using,
-                on=on,
-                expressions=match_expressions,
-            )
-        )
+        self.execute(exp.Merge(this=this, using=using, on=on, whens=whens))
 
     def scd_type_2_by_time(
         self,
@@ -1460,7 +1510,7 @@ class EngineAdapter:
         # column names and then remove them from the unmanaged_columns
         if check_columns and check_columns == exp.Star():
             check_columns = [exp.column(col) for col in unmanaged_columns_to_types]
-        execution_ts = to_time_column(execution_time, time_data_type)
+        execution_ts = to_time_column(execution_time, time_data_type, self.dialect, nullable=True)
         if updated_at_as_valid_from:
             if not updated_at_col:
                 raise SQLMeshError(
@@ -1473,7 +1523,9 @@ class EngineAdapter:
         elif check_columns and (execution_time_as_valid_from or not truncate):
             update_valid_from_start = execution_ts
         else:
-            update_valid_from_start = to_time_column("1970-01-01 00:00:00+00:00", time_data_type)
+            update_valid_from_start = to_time_column(
+                "1970-01-01 00:00:00+00:00", time_data_type, self.dialect, nullable=True
+            )
         insert_valid_from_start = execution_ts if check_columns else updated_at_col  # type: ignore
         # joined._exists IS NULL is saying "if the row is deleted"
         delete_check = (
@@ -1739,7 +1791,9 @@ class EngineAdapter:
                     exp.select(
                         *unmanaged_columns_to_types,
                         insert_valid_from_start.as_(valid_from_col.this),  # type: ignore
-                        to_time_column(exp.null(), time_data_type).as_(valid_to_col.this),
+                        to_time_column(exp.null(), time_data_type, self.dialect, nullable=True).as_(
+                            valid_to_col.this
+                        ),
                     )
                     .from_("joined")
                     .where(updated_row_filter),
@@ -1761,7 +1815,8 @@ class EngineAdapter:
         source_table: QueryOrDF,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
         unique_key: t.Sequence[exp.Expression],
-        when_matched: t.Optional[t.Union[exp.When, t.List[exp.When]]] = None,
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
     ) -> None:
         source_queries, columns_to_types = self._get_source_queries_and_columns_to_types(
             source_table, columns_to_types, target_table=target_table
@@ -1773,36 +1828,48 @@ class EngineAdapter:
                 for part in unique_key
             )
         )
+        if merge_filter:
+            on = exp.and_(merge_filter, on)
+
         if not when_matched:
-            when_matched = exp.When(
-                matched=True,
+            match_expressions = [
+                exp.When(
+                    matched=True,
+                    source=False,
+                    then=exp.Update(
+                        expressions=[
+                            exp.column(col, MERGE_TARGET_ALIAS).eq(
+                                exp.column(col, MERGE_SOURCE_ALIAS)
+                            )
+                            for col in columns_to_types
+                        ],
+                    ),
+                )
+            ]
+        else:
+            match_expressions = when_matched.copy().expressions
+
+        match_expressions.append(
+            exp.When(
+                matched=False,
                 source=False,
-                then=exp.Update(
-                    expressions=[
-                        exp.column(col, MERGE_TARGET_ALIAS).eq(exp.column(col, MERGE_SOURCE_ALIAS))
-                        for col in columns_to_types
-                    ],
+                then=exp.Insert(
+                    this=exp.Tuple(expressions=[exp.column(col) for col in columns_to_types]),
+                    expression=exp.Tuple(
+                        expressions=[
+                            exp.column(col, MERGE_SOURCE_ALIAS) for col in columns_to_types
+                        ]
+                    ),
                 ),
             )
-        when_matched = ensure_list(when_matched)
-        when_not_matched = exp.When(
-            matched=False,
-            source=False,
-            then=exp.Insert(
-                this=exp.Tuple(expressions=[exp.column(col) for col in columns_to_types]),
-                expression=exp.Tuple(
-                    expressions=[exp.column(col, MERGE_SOURCE_ALIAS) for col in columns_to_types]
-                ),
-            ),
         )
-        match_expressions = when_matched + [when_not_matched]
         for source_query in source_queries:
             with source_query as query:
                 self._merge(
                     target_table=target_table,
                     query=query,
                     on=on,
-                    match_expressions=match_expressions,
+                    whens=exp.Whens(expressions=match_expressions),
                 )
 
     def rename_table(
@@ -2000,7 +2067,6 @@ class EngineAdapter:
         to_sql_kwargs = (
             {"unsupported_level": ErrorLevel.IGNORE} if ignore_unsupported_errors else {}
         )
-
         with self.transaction():
             for e in ensure_list(expressions):
                 sql = t.cast(
@@ -2040,6 +2106,11 @@ class EngineAdapter:
         Yields:
             The table expression
         """
+        name = exp.to_table(name)
+        # ensure that we use default catalog if none is not specified
+        if isinstance(name, exp.Table) and not name.catalog and name.db and self.default_catalog:
+            name.set("catalog", exp.parse_identifier(self.default_catalog))
+
         source_queries, columns_to_types = self._get_source_queries_and_columns_to_types(
             query_or_df, columns_to_types=columns_to_types, target_table=name
         )
@@ -2087,7 +2158,7 @@ class EngineAdapter:
 
     def _build_clustered_by_exp(
         self,
-        clustered_by: t.List[str],
+        clustered_by: t.List[exp.Expression],
         **kwargs: t.Any,
     ) -> t.Optional[exp.Cluster]:
         return None
@@ -2099,7 +2170,7 @@ class EngineAdapter:
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -2114,6 +2185,10 @@ class EngineAdapter:
                     this=exp.Literal.string(self._truncate_table_comment(table_description))
                 )
             )
+
+        if table_properties:
+            table_type = self._pop_creatable_type_from_properties(table_properties)
+            properties.extend(ensure_list(table_type))
 
         if properties:
             return exp.Properties(expressions=properties)
@@ -2156,7 +2231,7 @@ class EngineAdapter:
         """
         sql_gen_kwargs = {
             "dialect": self.dialect,
-            "pretty": False,
+            "pretty": self._pretty_sql,
             "comments": False,
             **self._sql_gen_kwargs,
             **kwargs,
@@ -2292,7 +2367,7 @@ class EngineAdapter:
             self.execute(self._build_create_comment_table_exp(table, table_comment, table_kind))
         except Exception:
             logger.warning(
-                f"Table comment for '{table.alias_or_name}' not registered - this may be due to limited permissions.",
+                f"Table comment for '{table.alias_or_name}' not registered - this may be due to limited permissions",
                 exc_info=True,
             )
 
@@ -2319,7 +2394,7 @@ class EngineAdapter:
                 self.execute(self._build_create_comment_column_exp(table, col, comment, table_kind))
             except Exception:
                 logger.warning(
-                    f"Column comments for column '{col}' in table '{table.alias_or_name}' not registered - this may be due to limited permissions.",
+                    f"Column comments for column '{col}' in table '{table.alias_or_name}' not registered - this may be due to limited permissions",
                     exc_info=True,
                 )
 

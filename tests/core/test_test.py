@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import typing as t
 from pathlib import Path
-from unittest.mock import call
+from unittest.mock import call, patch
 
 import pandas as pd
 import pytest
@@ -20,12 +20,13 @@ from sqlmesh.core.config import (
     ModelDefaultsConfig,
 )
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import get_console
 from sqlmesh.core.dialect import parse
 from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.macros import MacroEvaluator, macro
 from sqlmesh.core.model import Model, SqlModel, load_sql_based_model, model
 from sqlmesh.core.test.definition import ModelTest, PythonModelTest, SqlModelTest
-from sqlmesh.utils.errors import ConfigError, TestError
+from sqlmesh.utils.errors import ConfigError, SQLMeshError, TestError
 from sqlmesh.utils.yaml import dump as dump_yaml
 from sqlmesh.utils.yaml import load as load_yaml
 
@@ -342,6 +343,48 @@ test_foo:
             "  exp act   exp act exp act\n"
             "0   2   1     3   2   4   3\n"
             "1   1   2     2   3   3   4\n"
+        ),
+    )
+
+    model_sql = """
+SELECT
+    ARRAY_AGG(DISTINCT id_contact_b ORDER BY id_contact_b) AS aggregated_duplicates
+FROM
+    source
+GROUP BY
+    id_contact_a
+ORDER BY
+    id_contact_a
+    """
+
+    _check_successful_or_raise(
+        _create_test(
+            body=load_yaml(
+                """
+test_array_order:
+  model: test
+  inputs:
+    source:
+    - id_contact_a: a
+      id_contact_b: b
+    - id_contact_a: a
+      id_contact_b: c
+  outputs:
+    query:
+    - aggregated_duplicates:
+      - c
+      - b
+                """
+            ),
+            test_name="test_array_order",
+            model=_create_model(model_sql),
+            context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))),
+        ).run(),
+        expected_msg=(
+            """AssertionError: Data mismatch (exp: expected, act: actual)\n\n"""
+            "  aggregated_duplicates        \n"
+            "                    exp     act\n"
+            "0                (c, b)  (b, c)\n"
         ),
     )
 
@@ -1192,14 +1235,38 @@ test_foo:
         ]
     )
 
+    test = _create_test(
+        body=load_yaml(
+            """
+test_foo:
+  model: xyz
+  outputs:
+    query:
+      - cur_timestamp: "2023-01-01 12:05:03+00:00"
+  vars:
+    execution_time: "2023-01-01 12:05:03+00:00"
+            """
+        ),
+        test_name="test_foo",
+        model=_create_model("SELECT CURRENT_TIMESTAMP AS cur_timestamp"),
+        context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="bigquery"))),
+    )
+
+    spy_execute = mocker.spy(test.engine_adapter, "_execute")
+    _check_successful_or_raise(test.run())
+
+    spy_execute.assert_has_calls(
+        [call('''SELECT CAST('2023-01-01 12:05:03+00:00' AS TIMESTAMPTZ) AS "cur_timestamp"''')]
+    )
+
     @model("py_model", columns={"ts1": "timestamptz", "ts2": "timestamptz"})
     def execute(context, start, end, execution_time, **kwargs):
-        datetime_now = datetime.datetime.now()
+        datetime_now_utc = datetime.datetime.now(tz=datetime.timezone.utc)
 
         context.engine_adapter.execute(exp.select("CURRENT_TIMESTAMP"))
         current_timestamp = context.engine_adapter.cursor.fetchone()[0]
 
-        return pd.DataFrame([{"ts1": datetime_now, "ts2": current_timestamp}])
+        return pd.DataFrame([{"ts1": datetime_now_utc, "ts2": current_timestamp}])
 
     _check_successful_or_raise(
         _create_test(
@@ -1450,12 +1517,12 @@ test_foo:
         )
 
 
-def test_pyspark_python_model() -> None:
+def test_pyspark_python_model(tmp_path: Path) -> None:
     spark_connection_config = SparkConnectionConfig(
         config={
             "spark.master": "local",
-            "spark.sql.warehouse.dir": "/tmp/data_dir",
-            "spark.driver.extraJavaOptions": "-Dderby.system.home=/tmp/derby_dir",
+            "spark.sql.warehouse.dir": f"{tmp_path}/data_dir",
+            "spark.driver.extraJavaOptions": f"-Dderby.system.home={tmp_path}/derby_dir",
         },
     )
     config = Config(
@@ -1541,6 +1608,179 @@ test_parameterized_model_names:
 
     # The example project has one test and we added another one above
     assert len(results.successes) == 2
+
+
+def test_custom_testing_schema(mocker: MockerFixture) -> None:
+    test = _create_test(
+        body=load_yaml(
+            """
+test_foo:
+  model: xyz
+  schema: my_schema
+  outputs:
+    query:
+      - a: 1
+            """
+        ),
+        test_name="test_foo",
+        model=_create_model("SELECT 1 AS a"),
+        context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))),
+    )
+
+    spy_execute = mocker.spy(test.engine_adapter, "_execute")
+    _check_successful_or_raise(test.run())
+
+    spy_execute.assert_has_calls(
+        [
+            call('CREATE SCHEMA IF NOT EXISTS "memory"."my_schema"'),
+            call('SELECT 1 AS "a"'),
+            call('DROP SCHEMA IF EXISTS "memory"."my_schema" CASCADE'),
+        ]
+    )
+
+
+def test_pretty_query(mocker: MockerFixture) -> None:
+    test = _create_test(
+        body=load_yaml(
+            """
+test_foo:
+  model: xyz
+  schema: my_schema
+  outputs:
+    query:
+      - a: 1
+            """
+        ),
+        test_name="test_foo",
+        model=_create_model("SELECT 1 AS a"),
+        context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))),
+    )
+    test.engine_adapter._pretty_sql = True
+    spy_execute = mocker.spy(test.engine_adapter, "_execute")
+    _check_successful_or_raise(test.run())
+    spy_execute.assert_has_calls(
+        [
+            call('CREATE SCHEMA IF NOT EXISTS "memory"."my_schema"'),
+            call('SELECT\n  1 AS "a"'),
+            call('DROP SCHEMA IF EXISTS "memory"."my_schema" CASCADE'),
+        ]
+    )
+
+
+def test_complicated_recursive_cte() -> None:
+    model_sql = """
+WITH
+    RECURSIVE
+    chained_contacts AS (
+        -- Start with the initial set of contacts and their immediate nodes
+        SELECT
+            id_contact_a,
+            id_contact_b
+        FROM
+            source
+
+        UNION ALL
+
+        -- Recursive step to find further connected nodes
+        SELECT
+            chained_contacts.id_contact_a,
+            unfactorized_duplicates.id_contact_b
+        FROM
+            chained_contacts
+                JOIN source AS unfactorized_duplicates
+                     ON chained_contacts.id_contact_b = unfactorized_duplicates.id_contact_a
+    ),
+    id_contact_a_with_aggregated_id_contact_bs AS (
+        SELECT
+            id_contact_a,
+            ARRAY_AGG(DISTINCT id_contact_b ORDER BY id_contact_b) AS aggregated_id_contact_bs
+        FROM
+            chained_contacts
+        GROUP BY
+            id_contact_a
+    )
+SELECT
+    ARRAY_CONCAT([id_contact_a], aggregated_id_contact_bs) AS aggregated_duplicates
+FROM
+    id_contact_a_with_aggregated_id_contact_bs
+WHERE
+    id_contact_a NOT IN (
+        SELECT DISTINCT
+            id_contact_b
+        FROM
+            source
+    )
+ORDER BY
+    id_contact_a
+    """
+
+    _check_successful_or_raise(
+        _create_test(
+            body=load_yaml(
+                """
+test_recursive_ctes:
+  model: test
+  inputs:
+    source:
+      rows:
+        - id_contact_a: "a"
+          id_contact_b: "b"
+        - id_contact_a: "b"
+          id_contact_b: "c"
+        - id_contact_a: "c"
+          id_contact_b: "d"
+        - id_contact_a: "a"
+          id_contact_b: "g"
+        - id_contact_a: "b"
+          id_contact_b: "e"
+        - id_contact_a: "c"
+          id_contact_b: "f"
+        - id_contact_a: "x"
+          id_contact_b: "y"
+  outputs:
+    ctes:
+      id_contact_a_with_aggregated_id_contact_bs:
+        - id_contact_a: a
+          aggregated_id_contact_bs: [b, c, d, e, f, g]
+        - id_contact_a: x
+          aggregated_id_contact_bs: [y]
+        - id_contact_a: b
+          aggregated_id_contact_bs: [c, d, e, f]
+        - id_contact_a: c
+          aggregated_id_contact_bs: [d, f]
+    query:
+      rows:
+        - aggregated_duplicates: [a, b, c, d, e, f, g]
+        - aggregated_duplicates: [x, y]
+                """
+            ),
+            test_name="test_recursive_ctes",
+            model=_create_model(model_sql),
+            context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))),
+        ).run()
+    )
+
+
+def test_unknown_model_warns(mocker: MockerFixture) -> None:
+    body = load_yaml(
+        """
+model: unknown
+outputs:
+  query:
+  - c: 1
+        """
+    )
+
+    with patch.object(get_console(), "log_warning") as mock_logger:
+        ModelTest.create_test(
+            body=body,
+            test_name="test_unknown_model",
+            models={},  # type: ignore
+            engine_adapter=mocker.Mock(),
+            dialect=None,
+            path=None,
+        )
+        assert mock_logger.mock_calls == [call("Model '\"unknown\"' was not found")]
 
 
 def test_test_generation(tmp_path: Path) -> None:
@@ -1689,7 +1929,7 @@ def test_test_generation_with_data_structures(tmp_path: Path, column: str, expec
     bar_sql_file.write_text("MODEL (name sqlmesh_example.bar); SELECT col FROM external_table;")
 
     test = create_test(Context(paths=tmp_path, config=config), f"SELECT {column} AS col")
-    assert test["test_foo"]["inputs"] == {"sqlmesh_example.bar": expected}
+    assert test["test_foo"]["inputs"] == {'"memory"."sqlmesh_example"."bar"': expected}
     assert test["test_foo"]["outputs"] == {"query": expected}
 
 
@@ -1712,20 +1952,137 @@ def test_test_generation_with_timestamp(tmp_path: Path) -> None:
     input_queries = {
         "sqlmesh_example.bar": "SELECT TIMESTAMP '2024-09-20 11:30:00.123456789' AS ts_col"
     }
-
-    context.create_test(
-        "sqlmesh_example.foo",
-        input_queries=input_queries,
-        overwrite=True,
-    )
+    context.create_test("sqlmesh_example.foo", input_queries=input_queries, overwrite=True)
 
     test = load_yaml(context.path / c.TESTS / "test_foo.yaml")
 
     assert len(test) == 1
     assert "test_foo" in test
     assert test["test_foo"]["inputs"] == {
-        "sqlmesh_example.bar": [{"ts_col": datetime.datetime(2024, 9, 20, 11, 30, 0, 123456)}]
+        '"memory"."sqlmesh_example"."bar"': [
+            {"ts_col": datetime.datetime(2024, 9, 20, 11, 30, 0, 123456)}
+        ]
     }
     assert test["test_foo"]["outputs"] == {
         "query": [{"ts_col": datetime.datetime(2024, 9, 20, 11, 30, 0, 123456)}]
     }
+
+
+def test_test_generation_with_decimal(tmp_path: Path, mocker: MockerFixture) -> None:
+    from decimal import Decimal
+
+    init_example_project(tmp_path, dialect="duckdb")
+
+    config = Config(
+        default_connection=DuckDBConnectionConfig(),
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+    foo_sql_file = tmp_path / "models" / "foo.sql"
+    foo_sql_file.write_text(
+        "MODEL (name sqlmesh_example.foo); SELECT dec_col FROM sqlmesh_example.bar;"
+    )
+    bar_sql_file = tmp_path / "models" / "bar.sql"
+    bar_sql_file.write_text("MODEL (name sqlmesh_example.bar); SELECT dec_col FROM external_table;")
+
+    context = Context(paths=tmp_path, config=config)
+    input_queries = {
+        '"memory"."sqlmesh_example"."bar"': "SELECT CAST(1.23 AS DECIMAL(10,2)) AS dec_col"
+    }
+
+    # DuckDB actually returns a numpy.float64, even though the value is cast into a DECIMAL,
+    # but other engines don't behave the same. E.g. BigQuery returns a proper Decimal value.
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.base.EngineAdapter.fetchdf",
+        return_value=pd.DataFrame({"dec_col": [Decimal("1.23")]}),
+    )
+
+    context.create_test("sqlmesh_example.foo", input_queries=input_queries, overwrite=True)
+
+    test = load_yaml(context.path / c.TESTS / "test_foo.yaml")
+
+    assert len(test) == 1
+    assert "test_foo" in test
+    assert test["test_foo"]["inputs"] == {'"memory"."sqlmesh_example"."bar"': [{"dec_col": "1.23"}]}
+    assert test["test_foo"]["outputs"] == {"query": [{"dec_col": "1.23"}]}
+
+
+def test_test_generation_with_recursive_ctes(tmp_path: Path) -> None:
+    init_example_project(tmp_path, dialect="duckdb")
+
+    config = Config(
+        default_connection=DuckDBConnectionConfig(),
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+    foo_sql_file = tmp_path / "models" / "foo.sql"
+    foo_sql_file.write_text(
+        "MODEL (name sqlmesh_example.foo);"
+        "WITH RECURSIVE t AS (SELECT 1 AS c UNION ALL SELECT c + 1 FROM t WHERE c < 3) SELECT c FROM t"
+    )
+
+    context = Context(paths=tmp_path, config=config)
+    context.plan(auto_apply=True)
+
+    context.create_test("sqlmesh_example.foo", input_queries={}, overwrite=True, include_ctes=True)
+
+    test = load_yaml(context.path / c.TESTS / "test_foo.yaml")
+    assert len(test) == 1
+    assert "test_foo" in test
+    assert test["test_foo"]["inputs"] == {}
+    assert test["test_foo"]["outputs"] == {
+        "query": [{"c": 1}, {"c": 2}, {"c": 3}],
+        "ctes": {
+            "t": [{"c": 1}, {"c": 2}, {"c": 3}],
+        },
+    }
+
+    _check_successful_or_raise(context.test())
+
+
+def test_test_with_gateway_specific_model(tmp_path: Path, mocker: MockerFixture) -> None:
+    init_example_project(tmp_path, dialect="duckdb")
+
+    config = Config(
+        gateways={
+            "main": GatewayConfig(connection=DuckDBConnectionConfig()),
+            "second": GatewayConfig(connection=DuckDBConnectionConfig()),
+        },
+        default_gateway="main",
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+    gw_model_sql_file = tmp_path / "models" / "gw_model.sql"
+
+    # The model has a gateway specified which isn't the default
+    gw_model_sql_file.write_text(
+        "MODEL (name sqlmesh_example.gw_model, gateway second); SELECT c FROM sqlmesh_example.input_model;"
+    )
+    input_model_sql_file = tmp_path / "models" / "input_model.sql"
+    input_model_sql_file.write_text(
+        "MODEL (name sqlmesh_example.input_model); SELECT c FROM external_table;"
+    )
+
+    context = Context(paths=tmp_path, config=config)
+    input_queries = {'"memory"."sqlmesh_example"."input_model"': "SELECT 5 AS c"}
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.base.EngineAdapter.fetchdf",
+        return_value=pd.DataFrame({"c": [5]}),
+    )
+
+    assert context.engine_adapter == context._engine_adapters["main"]
+    with pytest.raises(
+        SQLMeshError, match=r"Gateway 'wrong' not found in the available engine adapters."
+    ):
+        context._get_engine_adapter("wrong")
+
+    # Create test should use the gateway specific engine adapter
+    context.create_test("sqlmesh_example.gw_model", input_queries=input_queries, overwrite=True)
+    assert context._get_engine_adapter("second") == context._engine_adapters["second"]
+    assert len(context._engine_adapters) == 2
+
+    test = load_yaml(context.path / c.TESTS / "test_gw_model.yaml")
+
+    assert len(test) == 1
+    assert "test_gw_model" in test
+    assert test["test_gw_model"]["inputs"] == {
+        '"memory"."sqlmesh_example"."input_model"': [{"c": 5}]
+    }
+    assert test["test_gw_model"]["outputs"] == {"query": [{"c": 5}]}

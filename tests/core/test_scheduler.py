@@ -3,27 +3,32 @@ import typing as t
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import parse_one, parse
+from sqlglot.helper import first
 
-from sqlmesh.core.audit import AuditResult
 from sqlmesh.core.context import Context
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.model import load_sql_based_model
-from sqlmesh.core.model.definition import SqlModel
+from sqlmesh.core.model.definition import AuditResult, SqlModel
 from sqlmesh.core.model.kind import (
-    FullKind,
     IncrementalByTimeRangeKind,
     IncrementalByUniqueKeyKind,
     TimeColumn,
 )
 from sqlmesh.core.node import IntervalUnit
-from sqlmesh.core.scheduler import Scheduler, compute_interval_params
+from sqlmesh.core.scheduler import (
+    Scheduler,
+    interval_diff,
+    compute_interval_params,
+    SnapshotToIntervals,
+)
+from sqlmesh.core.signal import signal
 from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotEvaluator,
     SnapshotChangeCategory,
     DeployabilityIndex,
 )
-from sqlmesh.utils.date import to_datetime
+from sqlmesh.utils.date import to_datetime, to_timestamp, DatetimeRanges, TimeLike
 from sqlmesh.utils.errors import CircuitBreakerError, AuditError
 
 
@@ -52,16 +57,28 @@ def test_interval_params(scheduler: Scheduler, sushi_context_fixed_date: Context
 
     assert compute_interval_params([orders, waiter_revenue], start=start_ds, end=end_ds) == {
         orders: [
-            (to_datetime(start_ds), to_datetime("2022-01-31")),
-            (to_datetime("2022-01-31"), to_datetime("2022-02-06")),
+            (to_timestamp(start_ds), to_timestamp("2022-02-06")),
         ],
         waiter_revenue: [
-            (to_datetime(start_ds), to_datetime("2022-01-11")),
-            (to_datetime("2022-01-11"), to_datetime("2022-01-21")),
-            (to_datetime("2022-01-21"), to_datetime("2022-01-31")),
-            (to_datetime("2022-01-31"), to_datetime("2022-02-06")),
+            (to_timestamp(start_ds), to_timestamp("2022-02-06")),
         ],
     }
+
+
+@pytest.fixture
+def get_batched_missing_intervals() -> (
+    t.Callable[[Scheduler, TimeLike, TimeLike, t.Optional[TimeLike]], SnapshotToIntervals]
+):
+    def _get_batched_missing_intervals(
+        scheduler: Scheduler,
+        start: TimeLike,
+        end: TimeLike,
+        execution_time: t.Optional[TimeLike] = None,
+    ) -> SnapshotToIntervals:
+        merged_intervals = scheduler.merged_missing_intervals(start, end, execution_time)
+        return scheduler.batch_intervals(merged_intervals, start, end, execution_time)
+
+    return _get_batched_missing_intervals
 
 
 def test_interval_params_nonconsecutive(scheduler: Scheduler, orders: Snapshot):
@@ -72,8 +89,8 @@ def test_interval_params_nonconsecutive(scheduler: Scheduler, orders: Snapshot):
 
     assert compute_interval_params([orders], start=start_ds, end=end_ds) == {
         orders: [
-            (to_datetime(start_ds), to_datetime("2022-01-10")),
-            (to_datetime("2022-01-16"), to_datetime("2022-02-06")),
+            (to_timestamp(start_ds), to_timestamp("2022-01-10")),
+            (to_timestamp("2022-01-16"), to_timestamp("2022-02-06")),
         ]
     }
 
@@ -89,7 +106,7 @@ def test_interval_params_missing(scheduler: Scheduler, sushi_context_fixed_date:
     assert compute_interval_params(
         sushi_context_fixed_date.snapshots.values(), start=start_ds, end=end_ds
     )[waiters] == [
-        (to_datetime(start_ds), to_datetime("2022-03-02")),
+        (to_timestamp(start_ds), to_timestamp("2022-03-02")),
     ]
 
 
@@ -111,7 +128,9 @@ def test_run(sushi_context_fixed_date: Context, scheduler: Scheduler):
     ) == (0, "Hotate", 5.99)
 
 
-def test_incremental_by_unique_key_kind_dag(mocker: MockerFixture, make_snapshot):
+def test_incremental_by_unique_key_kind_dag(
+    mocker: MockerFixture, make_snapshot, get_batched_missing_intervals
+):
     """
     Test that when given a week of data that it batches dates together.
     """
@@ -128,7 +147,7 @@ def test_incremental_by_unique_key_kind_dag(mocker: MockerFixture, make_snapshot
             query=parse_one("SELECT id FROM VALUES (1), (2) AS t(id)"),
         ),
     )
-    snapshot_evaluator = SnapshotEvaluator(adapter=mocker.MagicMock(), ddl_concurrent_tasks=1)
+    snapshot_evaluator = SnapshotEvaluator(adapters=mocker.MagicMock(), ddl_concurrent_tasks=1)
     mock_state_sync = mocker.MagicMock()
     scheduler = Scheduler(
         snapshots=[unique_by_key_snapshot],
@@ -137,18 +156,19 @@ def test_incremental_by_unique_key_kind_dag(mocker: MockerFixture, make_snapshot
         max_workers=2,
         default_catalog=None,
     )
-    batches = scheduler.batches(start, end, end)
+    batches = get_batched_missing_intervals(scheduler, start, end, end)
     dag = scheduler._dag(batches)
     assert dag.graph == {
         (
             unique_by_key_snapshot.name,
-            ((to_datetime("2023-01-01"), to_datetime("2023-01-07")), 0),
+            ((to_timestamp("2023-01-01"), to_timestamp("2023-01-07")), 0),
         ): set(),
     }
-    mock_state_sync.refresh_snapshot_intervals.assert_called_once()
 
 
-def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapshot):
+def test_incremental_time_self_reference_dag(
+    mocker: MockerFixture, make_snapshot, get_batched_missing_intervals
+):
     """
     Test that we always process a day at a time and all future days rely on the previous day
     """
@@ -168,7 +188,7 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
     incremental_self_snapshot.add_interval("2023-01-02", "2023-01-02")
     incremental_self_snapshot.add_interval("2023-01-05", "2023-01-05")
 
-    snapshot_evaluator = SnapshotEvaluator(adapter=mocker.MagicMock(), ddl_concurrent_tasks=1)
+    snapshot_evaluator = SnapshotEvaluator(adapters=mocker.MagicMock(), ddl_concurrent_tasks=1)
     scheduler = Scheduler(
         snapshots=[incremental_self_snapshot],
         snapshot_evaluator=snapshot_evaluator,
@@ -176,62 +196,62 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
         max_workers=2,
         default_catalog=None,
     )
-    batches = scheduler.batches(start, end, end)
+    batches = get_batched_missing_intervals(scheduler, start, end, end)
     dag = scheduler._dag(batches)
 
     assert dag.graph == {
         # Only run one day at a time and each day relies on the previous days
         (
             incremental_self_snapshot.name,
-            ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0),
+            ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0),
         ): set(),
         (
             incremental_self_snapshot.name,
-            ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 1),
+            ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 1),
         ): {
             (
                 incremental_self_snapshot.name,
-                ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0),
+                ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0),
             )
         },
         (
             incremental_self_snapshot.name,
-            ((to_datetime("2023-01-04"), to_datetime("2023-01-05")), 2),
+            ((to_timestamp("2023-01-04"), to_timestamp("2023-01-05")), 2),
         ): {
             (
                 incremental_self_snapshot.name,
-                ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 1),
+                ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 1),
             ),
         },
         (
             incremental_self_snapshot.name,
-            ((to_datetime("2023-01-06"), to_datetime("2023-01-07")), 3),
+            ((to_timestamp("2023-01-06"), to_timestamp("2023-01-07")), 3),
         ): {
             (
                 incremental_self_snapshot.name,
-                ((to_datetime("2023-01-04"), to_datetime("2023-01-05")), 2),
+                ((to_timestamp("2023-01-04"), to_timestamp("2023-01-05")), 2),
             ),
         },
         (
             incremental_self_snapshot.name,
-            ((to_datetime(0), to_datetime(0)), -1),
+            ((to_timestamp(0), to_timestamp(0)), -1),
         ): set(
             [
                 (
                     incremental_self_snapshot.name,
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0),
                 ),
                 (
                     incremental_self_snapshot.name,
-                    ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 1),
+                    ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 1),
                 ),
                 (
                     incremental_self_snapshot.name,
-                    ((to_datetime("2023-01-04"), to_datetime("2023-01-05")), 2),
+                    ((to_timestamp("2023-01-04"), to_timestamp("2023-01-05")), 2),
                 ),
                 (
                     incremental_self_snapshot.name,
-                    ((to_datetime("2023-01-06"), to_datetime("2023-01-07")), 3),
+                    ((to_timestamp("2023-01-06"), to_timestamp("2023-01-07")), 3),
                 ),
             ]
         ),
@@ -247,14 +267,14 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
             {
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-03")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-03")), 0),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-03"), to_datetime("2023-01-05")), 1),
+                    ((to_timestamp("2023-01-03"), to_timestamp("2023-01-05")), 1),
                 ): set(),
-                ('"test_model"', ((to_datetime("2023-01-05"), to_datetime("2023-01-07")), 2)): {
-                    ('"test_model"', ((to_datetime("2023-01-01"), to_datetime("2023-01-03")), 0)),
+                ('"test_model"', ((to_timestamp("2023-01-05"), to_timestamp("2023-01-07")), 2)): {
+                    ('"test_model"', ((to_timestamp("2023-01-01"), to_timestamp("2023-01-03")), 0)),
                 },
             },
         ),
@@ -264,24 +284,24 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
             {
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-02"), to_datetime("2023-01-03")), 1),
+                    ((to_timestamp("2023-01-02"), to_timestamp("2023-01-03")), 1),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 2),
+                    ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 2),
                 ): set(),
-                ('"test_model"', ((to_datetime("2023-01-04"), to_datetime("2023-01-05")), 3)): {
-                    ('"test_model"', ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0)),
+                ('"test_model"', ((to_timestamp("2023-01-04"), to_timestamp("2023-01-05")), 3)): {
+                    ('"test_model"', ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0)),
                 },
-                ('"test_model"', ((to_datetime("2023-01-05"), to_datetime("2023-01-06")), 4)): {
-                    ('"test_model"', ((to_datetime("2023-01-02"), to_datetime("2023-01-03")), 1)),
+                ('"test_model"', ((to_timestamp("2023-01-05"), to_timestamp("2023-01-06")), 4)): {
+                    ('"test_model"', ((to_timestamp("2023-01-02"), to_timestamp("2023-01-03")), 1)),
                 },
-                ('"test_model"', ((to_datetime("2023-01-06"), to_datetime("2023-01-07")), 5)): {
-                    ('"test_model"', ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 2)),
+                ('"test_model"', ((to_timestamp("2023-01-06"), to_timestamp("2023-01-07")), 5)): {
+                    ('"test_model"', ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 2)),
                 },
             },
         ),
@@ -291,27 +311,27 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
             {
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-02")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-02")), 0),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-02"), to_datetime("2023-01-03")), 1),
+                    ((to_timestamp("2023-01-02"), to_timestamp("2023-01-03")), 1),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-03"), to_datetime("2023-01-04")), 2),
+                    ((to_timestamp("2023-01-03"), to_timestamp("2023-01-04")), 2),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-04"), to_datetime("2023-01-05")), 3),
+                    ((to_timestamp("2023-01-04"), to_timestamp("2023-01-05")), 3),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-05"), to_datetime("2023-01-06")), 4),
+                    ((to_timestamp("2023-01-05"), to_timestamp("2023-01-06")), 4),
                 ): set(),
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-06"), to_datetime("2023-01-07")), 5),
+                    ((to_timestamp("2023-01-06"), to_timestamp("2023-01-07")), 5),
                 ): set(),
             },
         ),
@@ -321,7 +341,7 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
             {
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-07")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-07")), 0),
                 ): set(),
             },
         ),
@@ -331,7 +351,7 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
             {
                 (
                     '"test_model"',
-                    ((to_datetime("2023-01-01"), to_datetime("2023-01-07")), 0),
+                    ((to_timestamp("2023-01-01"), to_timestamp("2023-01-07")), 0),
                 ): set(),
             },
         ),
@@ -340,6 +360,7 @@ def test_incremental_time_self_reference_dag(mocker: MockerFixture, make_snapsho
 def test_incremental_batch_concurrency(
     mocker: MockerFixture,
     make_snapshot,
+    get_batched_missing_intervals,
     batch_size: int,
     batch_concurrency: int,
     expected_graph: t.Dict[str, t.Any],
@@ -358,7 +379,7 @@ def test_incremental_batch_concurrency(
         ),
     )
 
-    snapshot_evaluator = SnapshotEvaluator(adapter=mocker.MagicMock(), ddl_concurrent_tasks=1)
+    snapshot_evaluator = SnapshotEvaluator(adapters=mocker.MagicMock(), ddl_concurrent_tasks=1)
     mock_state_sync = mocker.MagicMock()
     scheduler = Scheduler(
         snapshots=[snapshot],
@@ -368,7 +389,7 @@ def test_incremental_batch_concurrency(
         default_catalog=None,
     )
 
-    batches = scheduler.batches(start, end, end)
+    batches = get_batched_missing_intervals(scheduler, start, end, end)
     dag = scheduler._dag(batches)
     graph = {k: v for k, v in dag.graph.items() if k[1][1] != -1}  # exclude the terminal node.}
     assert graph == expected_graph
@@ -385,7 +406,9 @@ def test_circuit_breaker(scheduler: Scheduler):
         )
 
 
-def test_intervals_with_end_date_on_model(mocker: MockerFixture, make_snapshot):
+def test_intervals_with_end_date_on_model(
+    mocker: MockerFixture, make_snapshot, get_batched_missing_intervals
+):
     snapshot: Snapshot = make_snapshot(
         SqlModel(
             name="name",
@@ -397,7 +420,7 @@ def test_intervals_with_end_date_on_model(mocker: MockerFixture, make_snapshot):
         )
     )
 
-    snapshot_evaluator = SnapshotEvaluator(adapter=mocker.MagicMock(), ddl_concurrent_tasks=1)
+    snapshot_evaluator = SnapshotEvaluator(adapters=mocker.MagicMock(), ddl_concurrent_tasks=1)
     scheduler = Scheduler(
         snapshots=[snapshot],
         snapshot_evaluator=snapshot_evaluator,
@@ -408,27 +431,35 @@ def test_intervals_with_end_date_on_model(mocker: MockerFixture, make_snapshot):
 
     # generate for 1 year to show that the returned batches should only cover
     # the range defined on the model itself
-    batches = scheduler.batches(start="2023-01-01", end="2024-01-01")[snapshot]
+    batches = get_batched_missing_intervals(scheduler, start="2023-01-01", end="2024-01-01")[
+        snapshot
+    ]
 
     assert len(batches) == 31  # days in Jan 2023
-    assert batches[0] == (to_datetime("2023-01-01"), to_datetime("2023-01-02"))
-    assert batches[-1] == (to_datetime("2023-01-31"), to_datetime("2023-02-01"))
+    assert batches[0] == (to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))
+    assert batches[-1] == (to_timestamp("2023-01-31"), to_timestamp("2023-02-01"))
 
     # generate for less than 1 month to ensure that the scheduler end date
     # takes precedence over the model end date
-    batches = scheduler.batches(start="2023-01-01", end="2023-01-10")[snapshot]
+    batches = get_batched_missing_intervals(scheduler, start="2023-01-01", end="2023-01-10")[
+        snapshot
+    ]
 
     assert len(batches) == 10
-    assert batches[0] == (to_datetime("2023-01-01"), to_datetime("2023-01-02"))
-    assert batches[-1] == (to_datetime("2023-01-10"), to_datetime("2023-01-11"))
+    assert batches[0] == (to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))
+    assert batches[-1] == (to_timestamp("2023-01-10"), to_timestamp("2023-01-11"))
 
     # generate for the last day of range
-    batches = scheduler.batches(start="2023-01-31", end="2023-01-31")[snapshot]
+    batches = get_batched_missing_intervals(scheduler, start="2023-01-31", end="2023-01-31")[
+        snapshot
+    ]
     assert len(batches) == 1
-    assert batches[0] == (to_datetime("2023-01-31"), to_datetime("2023-02-01"))
+    assert batches[0] == (to_timestamp("2023-01-31"), to_timestamp("2023-02-01"))
 
     # generate for future days to ensure no future batches are loaded
-    snapshot_to_batches = scheduler.batches(start="2023-02-01", end="2023-02-28")
+    snapshot_to_batches = get_batched_missing_intervals(
+        scheduler, start="2023-02-01", end="2023-02-28"
+    )
     assert len(snapshot_to_batches) == 0
 
 
@@ -451,7 +482,7 @@ def test_external_model_audit(mocker, make_snapshot):
     snapshot = make_snapshot(model)
     snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
 
-    evaluator = SnapshotEvaluator(adapter=mocker.MagicMock())
+    evaluator = SnapshotEvaluator(adapters=mocker.MagicMock())
     spy = mocker.spy(evaluator, "_audit")
 
     scheduler = Scheduler(
@@ -472,94 +503,6 @@ def test_external_model_audit(mocker, make_snapshot):
     spy.assert_called_once()
 
 
-def test_contiguous_intervals():
-    from sqlmesh.core.scheduler import _contiguous_intervals as ci
-
-    assert ci([]) == []
-    assert ci([(0, 1)]) == [[(0, 1)]]
-    assert ci([(0, 1), (1, 2), (2, 3)]) == [[(0, 1), (1, 2), (2, 3)]]
-    assert ci([(0, 1), (3, 4), (4, 5), (6, 7)]) == [
-        [(0, 1)],
-        [(3, 4), (4, 5)],
-        [(6, 7)],
-    ]
-
-
-def test_check_ready_intervals(mocker: MockerFixture):
-    from sqlmesh.core.scheduler import _check_ready_intervals, Interval
-
-    def const_signal(const):
-        signal_mock = mocker.Mock()
-        signal_mock.check_intervals = mocker.MagicMock(return_value=const)
-        return signal_mock
-
-    def assert_always_signal(intervals):
-        _check_ready_intervals(const_signal(True), intervals) == intervals
-
-    assert_always_signal([])
-    assert_always_signal([(0, 1)])
-    assert_always_signal([(0, 1), (1, 2)])
-    assert_always_signal([(0, 1), (2, 3)])
-
-    def assert_never_signal(intervals):
-        _check_ready_intervals(const_signal(False), intervals) == []
-
-    assert_never_signal([])
-    assert_never_signal([(0, 1)])
-    assert_never_signal([(0, 1), (1, 2)])
-    assert_never_signal([(0, 1), (2, 3)])
-
-    def to_intervals(values: t.List[t.Tuple[int, int]]) -> t.List[Interval]:
-        return [(to_datetime(s), to_datetime(e)) for s, e in values]
-
-    def assert_check_intervals(
-        intervals: t.List[t.Tuple[int, int]],
-        ready: t.List[t.List[t.Tuple[int, int]]],
-        expected: t.List[t.Tuple[int, int]],
-    ):
-        signal_mock = mocker.Mock()
-        signal_mock.check_intervals = mocker.MagicMock(side_effect=[to_intervals(r) for r in ready])
-        _check_ready_intervals(signal_mock, intervals) == expected
-
-    assert_check_intervals([], [], [])
-    assert_check_intervals([(0, 1)], [[]], [])
-    assert_check_intervals(
-        [(0, 1)],
-        [[(0, 1)]],
-        [(0, 1)],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2)],
-        [[(0, 1)]],
-        [(0, 1)],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2)],
-        [[(1, 2)]],
-        [(1, 2)],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2)],
-        [[(0, 1), (1, 2)]],
-        [(0, 1), (1, 2)],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2), (3, 4)],
-        [[], []],
-        [],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2), (3, 4)],
-        [[(0, 1)], []],
-        [(0, 1)],
-    )
-    assert_check_intervals(
-        [(0, 1), (1, 2), (3, 4)],
-        [[(0, 1)], [(3, 4)]],
-        [(0, 1), (3, 4)],
-    )
-
-
 def test_audit_failure_notifications(
     scheduler: Scheduler, waiter_names: Snapshot, mocker: MockerFixture
 ):
@@ -574,7 +517,8 @@ def test_audit_failure_notifications(
     notify_mock = mocker.Mock()
     mocker.patch("sqlmesh.core.notification_target.NotificationTargetManager.notify", notify_mock)
 
-    audit = next(iter(waiter_names.audits))
+    audit = first(waiter_names.model.audit_definitions.values())
+    query = waiter_names.model.render_query()
 
     def _evaluate():
         scheduler.evaluate(
@@ -585,26 +529,30 @@ def test_audit_failure_notifications(
             DeployabilityIndex.all_deployable(),
             0,
         )
-        _, kwargs = evaluator_audit_mock.call_args_list[0]
-        assert not kwargs["raise_exception"]
 
     evaluator_audit_mock.return_value = [
-        AuditResult(audit=audit, model=waiter_names.model, count=0, skipped=False)
+        AuditResult(audit=audit, model=waiter_names.model, query=query, count=0, skipped=False)
     ]
     _evaluate()
     assert notify_user_mock.call_count == 0
     assert notify_mock.call_count == 0
 
     evaluator_audit_mock.return_value = [
-        AuditResult(audit=audit, model=waiter_names.model, count=None, skipped=True)
+        AuditResult(audit=audit, model=waiter_names.model, query=query, count=None, skipped=True)
     ]
     _evaluate()
     assert notify_user_mock.call_count == 0
     assert notify_mock.call_count == 0
 
-    audit = audit.copy(update={"blocking": False})
     evaluator_audit_mock.return_value = [
-        AuditResult(audit=audit, model=waiter_names.model, count=1, skipped=False)
+        AuditResult(
+            audit=audit,
+            model=waiter_names.model,
+            query=query,
+            count=1,
+            skipped=False,
+            blocking=False,
+        )
     ]
     _evaluate()
     assert notify_user_mock.call_count == 1
@@ -612,9 +560,8 @@ def test_audit_failure_notifications(
     notify_user_mock.reset_mock()
     notify_mock.reset_mock()
 
-    audit = audit.copy(update={"blocking": True})
     evaluator_audit_mock.return_value = [
-        AuditResult(audit=audit, model=waiter_names.model, count=1, skipped=False)
+        AuditResult(audit=audit, model=waiter_names.model, query=query, count=1, skipped=False)
     ]
     with pytest.raises(AuditError):
         _evaluate()
@@ -622,44 +569,134 @@ def test_audit_failure_notifications(
     assert notify_mock.call_count == 1
 
 
-def test_signal_factory(mocker: MockerFixture, make_snapshot):
-    from sqlmesh.core.scheduler import signal_factory, Batch, Signal
+def test_interval_diff():
+    assert interval_diff([(1, 2)], []) == [(1, 2)]
+    assert interval_diff([(1, 2)], [(1, 2)]) == []
+    assert interval_diff([(1, 2)], [(0, 2)]) == []
+    assert interval_diff([(1, 2)], [(2, 3)]) == [(1, 2)]
+    assert interval_diff([(1, 2)], [(0, 1)]) == [(1, 2)]
+    assert interval_diff([(1, 2), (2, 3), (3, 4)], [(1, 4)]) == []
+    assert interval_diff([(1, 2), (2, 3), (3, 4)], [(1, 2)]) == [(2, 3), (3, 4)]
+    assert interval_diff([(4, 5)], [(1, 2), (2, 3)]) == [(4, 5)]
+    assert interval_diff(
+        [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)],
+        [(2, 3), (4, 6)],
+    ) == [(1, 2), (3, 4)]
 
-    class AlwaysReadySignal(Signal):
-        def check_intervals(self, batch: Batch):
-            return True
+    assert interval_diff(
+        [(1, 2), (2, 3), (3, 4)],
+        [(1, 3)],
+    ) == [(3, 4)]
 
-    signal_factory_invoked = 0
+    assert interval_diff(
+        [(1, 3), (3, 4)],
+        [(1, 2), (2, 3)],
+    ) == [(3, 4)]
 
-    @signal_factory
-    def factory(signal_metadata):
-        nonlocal signal_factory_invoked
-        signal_factory_invoked += 1
-        assert signal_metadata.get("kind") == "foo"
-        return AlwaysReadySignal()
+    assert interval_diff([(1, 2), (2, 3)], [(1, 2)], uninterrupted=True) == []
+    assert interval_diff([(1, 2), (2, 3)], [(3, 4)], uninterrupted=True) == [(1, 2), (2, 3)]
+    assert interval_diff([(1, 2), (2, 3)], [(2, 3)], uninterrupted=True) == [(1, 2)]
 
-    start = to_datetime("2023-01-01")
-    end = to_datetime("2023-01-07")
-    snapshot: Snapshot = make_snapshot(
-        SqlModel(
-            name="name",
-            kind=FullKind(),
-            owner="owner",
-            dialect="",
-            cron="@daily",
-            start=start,
-            query=parse_one("SELECT id FROM VALUES (1), (2) AS t(id)"),
-            signals=[{"kind": "foo"}],
+
+def test_signal_intervals(mocker: MockerFixture, make_snapshot, get_batched_missing_intervals):
+    @signal()
+    def signal_a(batch: DatetimeRanges):
+        return [batch[0], batch[1]]
+
+    @signal()
+    def signal_b(batch: DatetimeRanges):
+        return batch[-49:]
+
+    signals = signal.get_registry()
+
+    a = make_snapshot(
+        load_sql_based_model(
+            parse(  # type: ignore
+                """
+                MODEL (
+                    name a,
+                    kind FULL,
+                    start '2023-01-01',
+                    signals SIGNAL_A(),
+                );
+
+                SELECT 1 x;
+                """
+            ),
+            signal_definitions=signals,
         ),
     )
-    snapshot_evaluator = SnapshotEvaluator(adapter=mocker.MagicMock(), ddl_concurrent_tasks=1)
+
+    b = make_snapshot(
+        load_sql_based_model(
+            parse(  # type: ignore
+                """
+                MODEL (
+                    name b,
+                    kind FULL,
+                    cron '@hourly',
+                    start '2023-01-01',
+                    signals SIGNAL_B(),
+                );
+
+                SELECT 2 x;
+                """
+            ),
+            signal_definitions=signals,
+        ),
+        nodes={a.name: a.model},
+    )
+
+    c = make_snapshot(
+        load_sql_based_model(
+            parse(  # type: ignore
+                """
+                MODEL (
+                    name c,
+                    kind FULL,
+                    start '2023-01-01',
+                );
+
+                SELECT * FROM a UNION SELECT * FROM b
+                """
+            ),
+            signal_definitions=signals,
+        ),
+        nodes={a.name: a.model, b.name: b.model},
+    )
+    d = make_snapshot(
+        load_sql_based_model(
+            parse(  # type: ignore
+                """
+                MODEL (
+                    name d,
+                    kind FULL,
+                    start '2023-01-01',
+                );
+
+                SELECT * FROM c UNION SELECT * FROM d
+                """
+            ),
+            signal_definitions=signals,
+        ),
+        nodes={a.name: a.model, b.name: b.model, c.name: c.model},
+    )
+
+    snapshot_evaluator = SnapshotEvaluator(adapters=mocker.MagicMock(), ddl_concurrent_tasks=1)
     scheduler = Scheduler(
-        snapshots=[snapshot],
+        snapshots=[a, b, c, d],
         snapshot_evaluator=snapshot_evaluator,
         state_sync=mocker.MagicMock(),
         max_workers=2,
         default_catalog=None,
     )
-    scheduler.batches(start, end, end)
 
-    assert signal_factory_invoked > 0
+    batches = get_batched_missing_intervals(scheduler, "2023-01-01", "2023-01-03", None)
+
+    assert batches == {
+        a: [(to_timestamp("2023-01-01"), to_timestamp("2023-01-03"))],
+        b: [(to_timestamp("2023-01-01 23:00:00"), to_timestamp("2023-01-04"))],
+        # Full models and models that depend on past can't run for a discontinuous range
+        c: [],
+        d: [],
+    }

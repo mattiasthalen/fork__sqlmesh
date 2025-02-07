@@ -3,8 +3,9 @@ from __future__ import annotations
 import functools
 import logging
 import typing as t
-from argparse import Namespace
+from argparse import Namespace, SUPPRESS
 from collections import defaultdict
+from copy import deepcopy
 
 from hyperscript import h
 from IPython.core.display import display
@@ -23,7 +24,7 @@ from sqlmesh.cli.example_project import ProjectTemplate, init_example_project
 from sqlmesh.core import analytics
 from sqlmesh.core import constants as c
 from sqlmesh.core.config import load_configs
-from sqlmesh.core.console import get_console
+from sqlmesh.core.console import create_console, set_console, configure_console
 from sqlmesh.core.context import Context
 from sqlmesh.core.dialect import format_model_expressions, parse
 from sqlmesh.core.model import load_sql_based_model
@@ -52,7 +53,9 @@ def pass_sqlmesh_context(func: t.Callable) -> t.Callable:
                 f"Context must be defined and initialized with one of these names: {', '.join(CONTEXT_VARIABLE_NAMES)}"
             )
         old_console = context.console
-        context.console = get_console(display=self.display)
+        new_console = create_console(display=self.display)
+        context.console = new_console
+        set_console(new_console)
         context.refresh()
 
         magic_name = func.__name__
@@ -60,8 +63,19 @@ def pass_sqlmesh_context(func: t.Callable) -> t.Callable:
         if bound_method:
             args_split = arg_split(args[0])
             parser = bound_method.parser
-            # Calling the private method to bypass setting of defaults.
-            parsed_args, _ = parser._parse_known_args(args_split, Namespace())
+
+            original_parser_actions = deepcopy(parser._actions)
+            original_parser_defaults = parser._defaults
+
+            # Temporarily supress default values, otherwise any missing arg would be set and affect analytics
+            parser._defaults = {}
+            for action in parser._actions:
+                action.default = SUPPRESS
+
+            parsed_args, _ = parser.parse_known_args(args_split, Namespace())
+
+            parser._actions = original_parser_actions
+            parser._defaults = original_parser_defaults
 
             command_args = {k for k, v in parsed_args.__dict__.items() if v is not None}
             analytics.collector.on_magic_command(command_name=magic_name, command_args=command_args)
@@ -69,6 +83,7 @@ def pass_sqlmesh_context(func: t.Callable) -> t.Callable:
         func(self, context, *args, **kwargs)
 
         context.console = old_console
+        set_console(old_console)
 
     return wrapper
 
@@ -116,9 +131,8 @@ class SQLMeshMagics(Magics):
         args = parse_argstring(self.context, line)
         configs = load_configs(args.config, Context.CONFIG_TYPE, args.paths)
         log_limit = list(configs.values())[0].log_limit
-        configure_logging(
-            args.debug, args.ignore_warnings, log_limit=log_limit, log_file_dir=args.log_file_dir
-        )
+        configure_logging(args.debug, log_limit=log_limit, log_file_dir=args.log_file_dir)
+        configure_console(ignore_warnings=args.ignore_warnings)
         try:
             context = Context(paths=args.paths, config=configs, gateway=args.gateway)
             self._shell.user_ns["context"] = context
@@ -141,6 +155,11 @@ class SQLMeshMagics(Magics):
         type=str,
         help="Project template. Supported values: airflow, dbt, default, empty.",
     )
+    @argument(
+        "--dlt-pipeline",
+        type=str,
+        help="DLT pipeline for which to generate a SQLMesh project. Use alongside template: dlt",
+    )
     @line_magic
     def init(self, line: str) -> None:
         """Creates a SQLMesh project scaffold with a default SQL dialect."""
@@ -151,7 +170,7 @@ class SQLMeshMagics(Magics):
             )
         except ValueError:
             raise MagicError(f"Invalid project template '{args.template}'")
-        init_example_project(args.path, args.sql_dialect, project_template)
+        init_example_project(args.path, args.sql_dialect, project_template, args.dlt_pipeline)
         html = str(
             h(
                 "div",
@@ -333,6 +352,11 @@ class SQLMeshMagics(Magics):
         help="Skip the backfill step and only create a virtual update for the plan.",
     )
     @argument(
+        "--empty-backfill",
+        action="store_true",
+        help="Produce empty backfill. Like --skip-backfill no models will be backfilled, unlike --skip-backfill missing intervals will be recorded as if they were backfilled.",
+    )
+    @argument(
         "--forward-only",
         action="store_true",
         help="Create a plan for forward-only changes.",
@@ -377,7 +401,7 @@ class SQLMeshMagics(Magics):
         "--backfill-model",
         type=str,
         nargs="*",
-        help="Backfill only the models whose names match the expression. This is supported only when targeting a development environment.",
+        help="Backfill only the models whose names match the expression.",
     )
     @argument(
         "--no-diff",
@@ -396,6 +420,11 @@ class SQLMeshMagics(Magics):
         help="Enable preview for forward-only models when targeting a development environment.",
         default=None,
     )
+    @argument(
+        "--diff-rendered",
+        action="store_true",
+        help="Output text differences for the rendered versions of the models and standalone audits",
+    )
     @line_magic
     @pass_sqlmesh_context
     def plan(self, context: Context, line: str) -> None:
@@ -413,6 +442,7 @@ class SQLMeshMagics(Magics):
             backfill_models=args.backfill_model,
             no_gaps=args.no_gaps,
             skip_backfill=args.skip_backfill,
+            empty_backfill=args.empty_backfill,
             forward_only=args.forward_only,
             no_prompts=args.no_prompts,
             auto_apply=args.auto_apply,
@@ -423,6 +453,7 @@ class SQLMeshMagics(Magics):
             no_diff=args.no_diff,
             run=args.run,
             enable_preview=args.enable_preview,
+            diff_rendered=args.diff_rendered,
         )
 
     @magic_arguments()
@@ -440,6 +471,22 @@ class SQLMeshMagics(Magics):
         action="store_true",
         help="Run for all missing intervals, ignoring individual cron schedules.",
     )
+    @argument(
+        "--select-model",
+        type=str,
+        nargs="*",
+        help="Select specific models to run. Note: this always includes upstream dependencies.",
+    )
+    @argument(
+        "--exit-on-env-update",
+        type=int,
+        help="If set, the command will exit with the specified code if the run is interrupted by an update to the target environment.",
+    )
+    @argument(
+        "--no-auto-upstream",
+        action="store_true",
+        help="Do not automatically include upstream models. Only applicable when --select-model is used. Note: this may result in missing / invalid data for the selected models.",
+    )
     @line_magic
     @pass_sqlmesh_context
     def run_dag(self, context: Context, line: str) -> None:
@@ -452,6 +499,9 @@ class SQLMeshMagics(Magics):
             end=args.end,
             skip_janitor=args.skip_janitor,
             ignore_cron=args.ignore_cron,
+            select_models=args.select_model,
+            exit_on_env_update=args.exit_on_env_update,
+            no_auto_upstream=args.no_auto_upstream,
         )
         if not success:
             raise SQLMeshError("Error Running DAG. Check logs for details.")
@@ -668,6 +718,42 @@ class SQLMeshMagics(Magics):
 
     @magic_arguments()
     @argument(
+        "pipeline",
+        nargs="?",
+        type=str,
+        help="The dlt pipeline to attach for this SQLMesh project.",
+    )
+    @argument(
+        "--table",
+        "-t",
+        type=str,
+        nargs="*",
+        help="The specific dlt tables to refresh in the SQLMesh models.",
+    )
+    @argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="If set, existing models are overwritten with the new DLT tables.",
+    )
+    @line_magic
+    @pass_sqlmesh_context
+    def dlt_refresh(self, context: Context, line: str) -> None:
+        """Attaches to a DLT pipeline with the option to update specific or all missing tables in the SQLMesh project."""
+        from sqlmesh.integrations.dlt import generate_dlt_models
+
+        args = parse_argstring(self.dlt_refresh, line)
+        sqlmesh_models = generate_dlt_models(
+            context, args.pipeline, list(args.table or []), args.force
+        )
+        if sqlmesh_models:
+            model_names = "\n".join([f"- {model_name}" for model_name in sqlmesh_models])
+            context.console.log_success(f"Updated SQLMesh project with models:\n{model_names}")
+        else:
+            context.console.log_success("All SQLMesh models are up to date.")
+
+    @magic_arguments()
+    @argument(
         "--read",
         type=str,
         default="",
@@ -798,7 +884,7 @@ class SQLMeshMagics(Magics):
         "-q",
         type=str,
         nargs="+",
-        required=True,
+        default=[],
         help="Queries that will be used to generate data for the model's dependencies.",
     )
     @argument(
@@ -900,12 +986,13 @@ class SQLMeshMagics(Magics):
         help="Skip the connection test.",
         default=False,
     )
+    @argument("--verbose", "-v", action="store_true", help="Verbose output.")
     @line_magic
     @pass_sqlmesh_context
     def info(self, context: Context, line: str) -> None:
         """Display SQLMesh project information."""
         args = parse_argstring(self.info, line)
-        context.print_info(skip_connection=args.skip_connection)
+        context.print_info(skip_connection=args.skip_connection, verbose=args.verbose)
 
     @magic_arguments()
     @line_magic

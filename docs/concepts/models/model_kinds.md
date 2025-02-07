@@ -2,6 +2,8 @@
 
 This page describes the kinds of [models](./overview.md) SQLMesh supports, which determine how the data for a model is loaded.
 
+Find information about all model kind configuration parameters in the [model configuration reference page](../../reference/model_configuration.md).
+
 ## INCREMENTAL_BY_TIME_RANGE
 
 Models of the `INCREMENTAL_BY_TIME_RANGE` kind are computed incrementally based on a time range. This is an optimal choice for datasets in which records are captured over time and represent immutable facts such as events, logs, or transactions. Using this kind for appropriate datasets typically results in significant cost and time savings.
@@ -10,7 +12,7 @@ Only missing time intervals are processed during each execution for `INCREMENTAL
 
 An `INCREMENTAL_BY_TIME_RANGE` model has two requirements that other models do not: it must know which column contains the time data it will use to filter the data by time range, and it must contain a `WHERE` clause that filters the upstream data by time.
 
-The name of the column containing time data is specified in the model's `MODEL` DDL. It is specified ih the DDL `kind` specification's `time_column` key. This example shows the `MODEL` DDL for an `INCREMENTAL_BY_TIME_RANGE` model that stores time data in the "event_date" column:
+The name of the column containing time data is specified in the model's `MODEL` DDL. It is specified in the DDL `kind` specification's `time_column` key. This example shows the `MODEL` DDL for an `INCREMENTAL_BY_TIME_RANGE` model that stores time data in the "event_date" column:
 
 ```sql linenums="1"
 MODEL (
@@ -119,9 +121,9 @@ WHERE
 ```
 
 ### Idempotency
-It is recommended that queries of models of this kind are [idempotent](../glossary.md#idempotency) to prevent unexpected results during data [restatement](../plans.md#restatement-plans).
+We recommend making sure incremental by time range model queries are [idempotent](../glossary.md#idempotency) to prevent unexpected results during data [restatement](../plans.md#restatement-plans).
 
-Note, however, that upstream models and tables can impact a model's idempotency. For example, referencing an upstream model of kind [FULL](#full) in the model query automatically causes the model to be non-idempotent.
+Note, however, that upstream models and tables can impact a model's idempotency. For example, referencing an upstream model of kind [FULL](#full) in the model query automatically causes the model to be non-idempotent because its data could change on every model execution.
 
 ### Materialization strategy
 Depending on the target engine, models of the `INCREMENTAL_BY_TIME_RANGE` kind are materialized using the following strategies:
@@ -135,66 +137,6 @@ Depending on the target engine, models of the `INCREMENTAL_BY_TIME_RANGE` kind a
 | Redshift   | DELETE by time range, then INSERT         |
 | Postgres   | DELETE by time range, then INSERT         |
 | DuckDB     | DELETE by time range, then INSERT         |
-
-## INCREMENTAL_BY_PARTITION
-
-Models of the `INCREMENTAL_BY_PARTITION` kind are computed incrementally based on partition. A set of columns defines the model's partitioning key, and a partition is the group of rows with the same partitioning key value.
-
-This model kind is designed for the scenario where data rows should be loaded and updated as a group based on their shared value for the partitioning key. This kind may be used with any SQL engine; SQLMesh will automatically create partitioned tables on engines that support explicit table partitioning (e.g., [BigQuery](https://cloud.google.com/bigquery/docs/creating-partitioned-tables), [Databricks](https://docs.databricks.com/en/sql/language-manual/sql-ref-partition.html)).
-
-If a partitioning key in newly loaded data is not present in the model table, the new partitioning key and its data rows are inserted. If a partitioning key in newly loaded data is already present in the model table, **all the partitioning key's existing data rows in the model table are replaced** with the partitioning key's data rows in the newly loaded data. If a partitioning key is present in the model table but not present in the newly loaded data, the partitioning key's existing data rows are not modified and remain in the model table.
-
-This kind is a good fit for datasets that have the following traits:
-
-* The dataset's records can be grouped by a partitioning key.
-* Each record has a partitioning key associated with it.
-* It is appropriate to upsert records, so existing records can be overwritten by new arrivals when their partitioning keys match.
-* All existing records associated with a given partitioning key can be removed or overwritten when any new record has the partitioning key value.
-
-The column defining the partitioning key is specified in the model's `MODEL` DDL `partitioned_by` key. This example shows the `MODEL` DDL for an `INCREMENTAL_BY_PARTITION` model whose partition key is the row's value for the `region` column:
-
-```sql linenums="1" hl_lines="4"
-MODEL (
-  name db.events,
-  kind INCREMENTAL_BY_PARTITION,
-  partitioned_by region,
-);
-```
-
-Compound partition keys are also supported, such as `region` and `department`:
-
-```sql linenums="1" hl_lines="4"
-MODEL (
-  name db.events,
-  kind INCREMENTAL_BY_PARTITION,
-  partitioned_by (region, department),
-);
-```
-
-Date and/or timestamp column expressions are also supported (varies by SQL engine). This BigQuery example's partition key is based on the month each row's `event_date` occurred:
-
-```sql linenums="1" hl_lines="4"
-MODEL (
-  name db.events,
-  kind INCREMENTAL_BY_PARTITION,
-  partitioned_by DATETIME_TRUNC(event_date, MONTH)
-);
-```
-
-**Note**: Partial data [restatement](../plans.md#restatement-plans) is not supported for this model kind, which means that the entire table will be recreated from scratch if restated. This may lead to data loss, so data restatement is disabled for models of this kind by default.
-
-### Materialization strategy
-Depending on the target engine, models of the `INCREMENTAL_BY_PARTITION` kind are materialized using the following strategies:
-
-| Engine     | Strategy                                |
-|------------|-----------------------------------------|
-| Databricks | REPLACE WHERE by partitioning key       |
-| Spark      | INSERT OVERWRITE by partitioning key    |
-| Snowflake  | DELETE by partitioning key, then INSERT |
-| BigQuery   | DELETE by partitioning key, then INSERT |
-| Redshift   | DELETE by partitioning key, then INSERT |
-| Postgres   | DELETE by partitioning key, then INSERT |
-| DuckDB     | DELETE by partitioning key, then INSERT |
 
 ## INCREMENTAL_BY_UNIQUE_KEY
 
@@ -271,7 +213,9 @@ MODEL (
   name db.employees,
   kind INCREMENTAL_BY_UNIQUE_KEY (
     unique_key name,
-    when_matched WHEN MATCHED THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+    when_matched (
+      WHEN MATCHED THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+    )
   )
 );
 ```
@@ -285,8 +229,10 @@ MODEL (
   name db.employees,
   kind INCREMENTAL_BY_UNIQUE_KEY (
     unique_key name,
-    when_matched WHEN MATCHED AND source.value IS NULL THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary),
-    WHEN MATCHED THEN UPDATE SET target.title = COALESCE(source.title, target.title)
+    when_matched (
+      WHEN MATCHED AND source.value IS NULL THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+      WHEN MATCHED THEN UPDATE SET target.title = COALESCE(source.title, target.title)
+    )
   )
 );
 ```
@@ -296,8 +242,33 @@ MODEL (
 * BigQuery
 * Databricks
 * Postgres
+* Redshift
 * Snowflake
 * Spark
+
+Redshift supports only the `UPDATE` or `DELETE` actions for the `WHEN MATCHED` clause and does not allow multiple `WHEN MATCHED` expressions. For further information, refer to the [Redshift documentation](https://docs.aws.amazon.com/redshift/latest/dg/r_MERGE.html#r_MERGE-parameters).
+
+### Merge Filter Expression
+
+The `MERGE` statement typically induces a full table scan of the existing table, which can be problematic with large data volumes.
+
+Prevent a full table scan by passing filtering conditions to the `merge_filter` parameter.
+
+The `merge_filter` accepts a single or a conjunction of predicates to be used in the `ON` clause of the `MERGE` operation:
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name db.employee_contracts,
+  kind INCREMENTAL_BY_UNIQUE_KEY (
+    unique_key id,
+    merge_filter source._operation IS NULL AND target.contract_date > dateadd(day, -7, current_date)
+  )
+);
+```
+
+Similar to `when_matched`, the `source` and `target` aliases are used to distinguish between the source and target tables.
+
+If an existing dbt project uses the [incremental_predicates](https://docs.getdbt.com/docs/build/incremental-strategy#about-incremental_predicates) functionality, SQLMesh will automatically convert them into the equivalent `merge_filter` specification.
 
 ### Materialization strategy
 Depending on the target engine, models of the `INCREMENTAL_BY_UNIQUE_KEY` kind are materialized using the following strategies:
@@ -389,7 +360,7 @@ During the evaluation of a model of this kind, the view will be replaced or recr
 ## EMBEDDED
 Embedded models are a way to share common logic between different models of other kinds.
 
-There are no data assets (tables or views) associated with `EMBEDDED` models in the data warehouse. Instead, an `EMBEDDED` model's query is injected directly into the query of each downstream model that references it.
+There are no data assets (tables or views) associated with `EMBEDDED` models in the data warehouse. Instead, an `EMBEDDED` model's query is injected directly into the query of each downstream model that references it, as a subquery.
 
 This example specifies a `EMBEDDED` model kind:
 ```sql linenums="1" hl_lines="3"
@@ -420,7 +391,7 @@ There are two ways to tracking changes: By Time (Recommended) or By Column.
 
 ### SCD Type 2 By Time (Recommended)
 
-SCD Type 2 By Time supports sourcing from tables that have an "Updated At" timestamp defined in the table that tells you when a given was last updated.
+SCD Type 2 By Time supports sourcing from tables that have an "Updated At" timestamp defined in the table that tells you when a given record was last updated.
 This is the recommended way since this "Updated At" gives you a precise time when the record was last updated and therefore improves the accuracy of the SCD Type 2 table that is produced.
 
 This example specifies a `SCD_TYPE_2_BY_TIME` model kind:
@@ -548,12 +519,7 @@ TABLE db.menu_items (
 
 A hard delete is when a record no longer exists in the source table. When this happens,
 
-If `invalidate_hard_deletes` is set to `true` (default):
-
-* `valid_to` column will be set to the time when the SQLMesh run started that detected the missing record (called `execution_time`).
-* If the record is added back, then the `valid_to` column will remain unchanged.
-
-If `invalidate_hard_deletes` is set to `false`:
+If `invalidate_hard_deletes` is set to `false` (default):
 
 * `valid_to` column will continue to be set to `NULL` (therefore still considered "valid")
 * If the record is added back, then the `valid_to` column will be set to the `valid_from` of the new record.
@@ -563,13 +529,18 @@ When a record is added back, the new record will be inserted into the table with
 * SCD_TYPE_2_BY_TIME: the largest of either the `updated_at` timestamp of the new record or the `valid_from` timestamp of the deleted record in the SCD Type 2 table
 * SCD_TYPE_2_BY_COLUMN: the `execution_time` when the record was detected again
 
-One way to think about `invalidate_hard_deletes` is that, if enabled, deletes are most accurately tracked in the SCD Type 2 table since it records when the delete occurred.
+If `invalidate_hard_deletes` is set to `true`:
+
+* `valid_to` column will be set to the time when the SQLMesh run started that detected the missing record (called `execution_time`).
+* If the record is added back, then the `valid_to` column will remain unchanged.
+
+One way to think about `invalidate_hard_deletes` is that, if `invalidate_hard_deletes` is set to `true`, deletes are most accurately tracked in the SCD Type 2 table since it records when the delete occurred.
 As a result though, you can have gaps between records if the there is a gap of time between when it was deleted and added back.
-If you would prefer to not have gaps, and a result consider missing records in source as still "valid", then you can set `invalidate_hard_deletes` to `false`.
+If you would prefer to not have gaps, and a result consider missing records in source as still "valid", then you can leave the default value or set `invalidate_hard_deletes` to `false`.
 
 ### Example of SCD Type 2 By Time in Action
 
-Lets say that you started with the following data in your source table:
+Lets say that you started with the following data in your source table and `invalidate_hard_deletes` is set to `true`:
 
 | ID | Name             | Price |     Updated At      |
 |----|------------------|:-----:|:-------------------:|
@@ -645,7 +616,7 @@ Since in this case the updated at timestamp did not change it is likely the item
 
 ### Example of SCD Type 2 By Column in Action
 
-Lets say that you started with the following data in your source table:
+Lets say that you started with the following data in your source table and `invalidate_hard_deletes` is set to `true`:
 
 | ID | Name             | Price |
 |----|------------------|:-----:|
@@ -720,12 +691,28 @@ This is the most accurate representation of the menu based on the source data pr
 
 ### Shared Configuration Options
 
-| Name                     | Description                                                                                                                                                                        | Type                      |
-|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------|
-| unique_key               | Unique key used for identifying rows between source and target                                                                                                                     | List of strings or string |
-| valid_from_name          | The name of the `valid_from` column to create in the target table. Default: `valid_from`                                                                                           | string                    |
-| valid_to_name            | The name of the `valid_to` column to create in the target table. Default: `valid_to`                                                                                               | string                    |
-| invalidate_hard_deletes  | If set to `true`, when a record is missing from the source table it will be marked as invalid. Default: `true`                                                                     | bool                      |
+| Name                    | Description                                                                                                     | Type                      |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------|---------------------------|
+| unique_key              | Unique key used for identifying rows between source and target                                                  | List of strings or string |
+| valid_from_name         | The name of the `valid_from` column to create in the target table. Default: `valid_from`                        | string                    |
+| valid_to_name           | The name of the `valid_to` column to create in the target table. Default: `valid_to`                            | string                    |
+| invalidate_hard_deletes | If set to `true`, when a record is missing from the source table it will be marked as invalid. Default: `false` | bool                      |
+
+!!! tip "Important"
+
+    If using BigQuery, the default data type of the valid_from/valid_to columns is DATETIME. If you want to use TIMESTAMP, you can specify the data type in the model definition.
+
+    ```sql linenums="1" hl_lines="5"
+    MODEL (
+      name db.menu_items,
+      kind SCD_TYPE_2_BY_TIME (
+        unique_key id,
+        time_data_type TIMESTAMP
+      )
+    );
+    ```
+
+    This could likely be used on other engines to change the expected data type but has only been tested on BigQuery.
 
 ### SCD Type 2 By Time Configuration Options
 
@@ -839,6 +826,46 @@ GROUP BY
   id
 ```
 
+### Reset SCD Type 2 Model (clearing history)
+
+SCD Type 2 models are designed by default to protect the data that has been captured because it is not possible to recreate the history once it has been lost.
+However, there are cases where you may want to clear the history and start fresh.
+For this use use case you will want to start by setting `disable_restatement` to `false` in the model definition.
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name db.menu_items,
+  kind SCD_TYPE_2_BY_TIME (
+    unique_key id,
+    disable_restatement false
+  )
+);
+```
+
+Plan/apply this change to production.
+Then you will want to [restate the model](../plans.md#restatement-plans).
+
+```bash
+sqlmesh plan --restate-model db.menu_items
+```
+
+!!! warning
+
+    This will remove the historical data on the model which in most situations cannot be recovered.
+
+Once complete you will want to remove `disable_restatement` on the model definition which will set it back to `true` and prevent accidental data loss.
+
+```sql linenums="1"
+MODEL (
+  name db.menu_items,
+  kind SCD_TYPE_2_BY_TIME (
+    unique_key id,
+  )
+);
+```
+
+Plan/apply this change to production.
+
 ## EXTERNAL
 
 The EXTERNAL model kind is used to specify [external models](./external_models.md) that store metadata about external tables. External models are special; they are not specified in .sql files like the other model kinds. They are optional but useful for propagating column and type information for external tables queried in your SQLMesh project.
@@ -860,3 +887,136 @@ Due to there being no standard, each vendor has a different implementation with 
 We would recommend using standard SQLMesh model types in the first instance. However, if you do need to use Managed models, you still gain other SQLMesh benefits like the ability to use them in [virtual environments](../../concepts/overview#build-a-virtual-environment).
 
 See [Managed Models](./managed_models.md) for more information on which engines are supported and which properties are available.
+
+## INCREMENTAL_BY_PARTITION
+
+Models of the `INCREMENTAL_BY_PARTITION` kind are computed incrementally based on partition. A set of columns defines the model's partitioning key, and a partition is the group of rows with the same partitioning key value.
+
+!!! question "Should you use this model kind?"
+
+    Any model kind can use a partitioned **table** by specifying the [`partitioned_by` key](../models/overview.md#partitioned_by) in the `MODEL` DDL.
+
+    The "partition" in `INCREMENTAL_BY_PARTITION` is about how the data is **loaded** when the model runs.
+
+    `INCREMENTAL_BY_PARTITION` models are inherently [non-idempotent](../glossary.md#idempotency), so restatements and other actions can cause data loss. This makes them more complex to manage than other model kinds.
+
+    In most scenarios, an `INCREMENTAL_BY_TIME_RANGE` model can meet your needs and will be easier to manage. The `INCREMENTAL_BY_PARTITION` model kind should only be used when the data must be loaded by partition (usually for performance reasons).
+
+This model kind is designed for the scenario where data rows should be loaded and updated as a group based on their shared value for the partitioning key.
+
+It may be used with any SQL engine. SQLMesh will automatically create partitioned tables on engines that support explicit table partitioning (e.g., [BigQuery](https://cloud.google.com/bigquery/docs/creating-partitioned-tables), [Databricks](https://docs.databricks.com/en/sql/language-manual/sql-ref-partition.html)).
+
+New rows are loaded based on their partitioning key value:
+
+- If a partitioning key in newly loaded data is not present in the model table, the new partitioning key and its data rows are inserted.
+- If a partitioning key in newly loaded data is already present in the model table, **all the partitioning key's existing data rows in the model table are replaced** with the partitioning key's data rows in the newly loaded data.
+- If a partitioning key is present in the model table but not present in the newly loaded data, the partitioning key's existing data rows are not modified and remain in the model table.
+
+This kind should only be used for datasets that have the following traits:
+
+* The dataset's records can be grouped by a partitioning key.
+* Each record has a partitioning key associated with it.
+* It is appropriate to upsert records, so existing records can be overwritten by new arrivals when their partitioning keys match.
+* All existing records associated with a given partitioning key can be removed or overwritten when any new record has the partitioning key value.
+
+The column defining the partitioning key is specified in the model's `MODEL` DDL `partitioned_by` key. This example shows the `MODEL` DDL for an `INCREMENTAL_BY_PARTITION` model whose partition key is the row's value for the `region` column:
+
+```sql linenums="1" hl_lines="4"
+MODEL (
+  name db.events,
+  kind INCREMENTAL_BY_PARTITION,
+  partitioned_by region,
+);
+```
+
+Compound partition keys are also supported, such as `region` and `department`:
+
+```sql linenums="1" hl_lines="4"
+MODEL (
+  name db.events,
+  kind INCREMENTAL_BY_PARTITION,
+  partitioned_by (region, department),
+);
+```
+
+Date and/or timestamp column expressions are also supported (varies by SQL engine). This BigQuery example's partition key is based on the month each row's `event_date` occurred:
+
+```sql linenums="1" hl_lines="4"
+MODEL (
+  name db.events,
+  kind INCREMENTAL_BY_PARTITION,
+  partitioned_by DATETIME_TRUNC(event_date, MONTH)
+);
+```
+
+!!! warning "Only full restatements supported"
+
+    Partial data [restatements](../plans.md#restatement-plans) are used to reprocess part of a table's data (usually a limited time range).
+
+    Partial data restatement is not supported for `INCREMENTAL_BY_PARTITION` models. If you restate an `INCREMENTAL_BY_PARTITION` model, its entire table will be recreated from scratch.
+
+    Restating `INCREMENTAL_BY_PARTITION` models may lead to data loss and should be performed with care.
+
+### Example
+
+This is a fuller example of how you would use this model kind in practice. It limits the number of partitions to backfill based on time range in the `partitions_to_update` CTE.
+
+```sql linenums="1"
+MODEL (
+  name demo.incremental_by_partition_demo,
+  kind INCREMENTAL_BY_PARTITION,
+  partitioned_by user_segment,
+);
+
+-- This is the source of truth for what partitions need to be updated and will join to the product usage data
+-- This could be an INCREMENTAL_BY_TIME_RANGE model that reads in the user_segment values last updated in the past 30 days to reduce scope
+-- Use this strategy to reduce full restatements
+WITH partitions_to_update AS (
+  SELECT DISTINCT
+    user_segment
+  FROM demo.incremental_by_time_range_demo  -- upstream table tracking which user segments to update
+  WHERE last_updated_at BETWEEN DATE_SUB(@start_dt, INTERVAL 30 DAY) AND @end_dt
+),
+
+product_usage AS (
+  SELECT
+    product_id,
+    customer_id,
+    last_usage_date,
+    usage_count,
+    feature_utilization_score,
+    user_segment
+  FROM sqlmesh-public-demo.tcloud_raw_data.product_usage
+  WHERE user_segment IN (SELECT user_segment FROM partitions_to_update) -- partition filter applied here
+)
+
+SELECT
+  product_id,
+  customer_id,
+  last_usage_date,
+  usage_count,
+  feature_utilization_score,
+  user_segment,
+  CASE
+    WHEN usage_count > 100 AND feature_utilization_score > 0.7 THEN 'Power User'
+    WHEN usage_count > 50 THEN 'Regular User'
+    WHEN usage_count IS NULL THEN 'New User'
+    ELSE 'Light User'
+  END as user_type
+FROM product_usage
+```
+
+**Note**: Partial data [restatement](../plans.md#restatement-plans) is not supported for this model kind, which means that the entire table will be recreated from scratch if restated. This may lead to data loss.
+
+### Materialization strategy
+Depending on the target engine, models of the `INCREMENTAL_BY_PARTITION` kind are materialized using the following strategies:
+
+| Engine     | Strategy                                |
+|------------|-----------------------------------------|
+| Databricks | REPLACE WHERE by partitioning key       |
+| Spark      | INSERT OVERWRITE by partitioning key    |
+| Snowflake  | DELETE by partitioning key, then INSERT |
+| BigQuery   | DELETE by partitioning key, then INSERT |
+| Redshift   | DELETE by partitioning key, then INSERT |
+| Postgres   | DELETE by partitioning key, then INSERT |
+| DuckDB     | DELETE by partitioning key, then INSERT |

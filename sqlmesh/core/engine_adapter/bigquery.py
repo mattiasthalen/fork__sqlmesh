@@ -5,11 +5,15 @@ import typing as t
 from collections import defaultdict
 
 import pandas as pd
-from sqlglot import exp
+from sqlglot import exp, parse_one
 from sqlglot.transforms import remove_precision_parameterized_types
 
 from sqlmesh.core.dialect import to_schema
-from sqlmesh.core.engine_adapter.mixins import InsertOverwriteWithMergeMixin, ClusteredByMixin
+from sqlmesh.core.engine_adapter.mixins import (
+    InsertOverwriteWithMergeMixin,
+    ClusteredByMixin,
+    RowDiffMixin,
+)
 from sqlmesh.core.engine_adapter.shared import (
     CatalogSupport,
     DataObject,
@@ -19,6 +23,7 @@ from sqlmesh.core.engine_adapter.shared import (
 )
 from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.schema_diff import SchemaDiffer
+from sqlmesh.utils import optional_import
 from sqlmesh.utils.date import to_datetime
 from sqlmesh.utils.errors import SQLMeshError
 
@@ -31,18 +36,25 @@ if t.TYPE_CHECKING:
     from google.cloud.bigquery.table import Table as BigQueryTable
 
     from sqlmesh.core._typing import SchemaName, SessionProperties, TableName
-    from sqlmesh.core.engine_adapter._typing import DF, Query
+    from sqlmesh.core.engine_adapter._typing import BigframeSession, DF, Query
     from sqlmesh.core.engine_adapter.base import QueryOrDF
 
+
 logger = logging.getLogger(__name__)
+
+bigframes = optional_import("bigframes")
+bigframes_pd = optional_import("bigframes.pandas")
 
 
 NestedField = t.Tuple[str, str, t.List[str]]
 NestedFieldsDict = t.Dict[str, t.List[NestedField]]
 
+# used to tag AST nodes to be specially handled in alter_table()
+_CLUSTERING_META_KEY = "__sqlmesh_update_table_clustering"
+
 
 @set_catalog()
-class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
+class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin, RowDiffMixin):
     """
     BigQuery Engine Adapter using the `google-cloud-bigquery` library's DB API.
     """
@@ -52,7 +64,6 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
     SUPPORTS_TRANSACTIONS = False
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_CLONING = True
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     MAX_TABLE_COMMENT_LENGTH = 1024
     MAX_COLUMN_COMMENT_LENGTH = 1024
 
@@ -69,6 +80,11 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
             },
             exp.DataType.build("DATE", dialect=DIALECT): {
                 exp.DataType.build("DATETIME", dialect=DIALECT),
+            },
+        },
+        coerceable_types={
+            exp.DataType.build("FLOAT64", dialect=DIALECT): {
+                exp.DataType.build("BIGNUMERIC", dialect=DIALECT),
             },
         },
         support_coercing_compatible_types=True,
@@ -95,6 +111,17 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
         return self.connection._client
 
     @property
+    def bigframe(self) -> t.Optional[BigframeSession]:
+        if bigframes:
+            options = bigframes.BigQueryOptions(
+                credentials=self.client._credentials,
+                project=self.client.project,
+                location=self.client.location,
+            )
+            return bigframes.connect(context=options)
+        return None
+
+    @property
     def _job_params(self) -> t.Dict[str, t.Any]:
         from sqlmesh.core.config.connection import BigQueryPriority
 
@@ -107,6 +134,10 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
         if self._extra_config.get("maximum_bytes_billed"):
             params["maximum_bytes_billed"] = self._extra_config.get("maximum_bytes_billed")
         return params
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
 
     def _df_to_source_queries(
         self,
@@ -125,7 +156,12 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
         )
 
         def query_factory() -> Query:
-            if not self.table_exists(temp_table):
+            if bigframes_pd and isinstance(df, bigframes_pd.DataFrame):
+                df.to_gbq(
+                    f"{temp_bq_table.project}.{temp_bq_table.dataset_id}.{temp_bq_table.table_id}",
+                    if_exists="replace",
+                )
+            elif not self.table_exists(temp_table):
                 # Make mypy happy
                 assert isinstance(df, pd.DataFrame)
                 self._db_call(self.client.create_table, table=temp_bq_table, exists_ok=False)
@@ -216,17 +252,35 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
                 return "JSON"
             return kind.name
 
-        table = self._get_table(table_name)
-        columns = {
-            field.name: exp.DataType.build(
-                dtype_to_sql(field.to_standard_sql().type), dialect=self.dialect
-            )
-            for field in table.schema
-        }
-        if include_pseudo_columns and table.time_partitioning and not table.time_partitioning.field:
-            columns["_PARTITIONTIME"] = exp.DataType.build("TIMESTAMP")
-            if table.time_partitioning.type_ == "DAY":
-                columns["_PARTITIONDATE"] = exp.DataType.build("DATE")
+        def create_mapping_schema(
+            schema: t.Sequence[bigquery.SchemaField],
+        ) -> t.Dict[str, exp.DataType]:
+            return {
+                field.name: exp.DataType.build(
+                    dtype_to_sql(field.to_standard_sql().type), dialect=self.dialect
+                )
+                for field in schema
+            }
+
+        table = exp.to_table(table_name)
+        if len(table.parts) == 3 and "." in table.name:
+            # The client's `get_table` method can't handle paths with >3 identifiers
+            self.execute(exp.select("*").from_(table).limit(1))
+            query_results = self._query_job._query_results
+            columns = create_mapping_schema(query_results.schema)
+        else:
+            bq_table = self._get_table(table)
+            columns = create_mapping_schema(bq_table.schema)
+
+            if (
+                include_pseudo_columns
+                and bq_table.time_partitioning
+                and not bq_table.time_partitioning.field
+            ):
+                columns["_PARTITIONTIME"] = exp.DataType.build("TIMESTAMP")
+                if bq_table.time_partitioning.type_ == "DAY":
+                    columns["_PARTITIONDATE"] = exp.DataType.build("DATE")
+
         return columns
 
     def alter_table(
@@ -242,6 +296,18 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
 
         if nested_fields:
             self._update_table_schema_nested_fields(nested_fields, alter_expressions[0].this)
+
+        # this is easier than trying to detect exp.Cluster nodes
+        # or exp.Command nodes that contain the string "DROP CLUSTERING KEY"
+        clustering_change_operations = [
+            e for e in non_nested_expressions if _CLUSTERING_META_KEY in e.meta
+        ]
+        for op in clustering_change_operations:
+            non_nested_expressions.remove(op)
+            table, cluster_by = op.meta[_CLUSTERING_META_KEY]
+            assert isinstance(table, str) or isinstance(table, exp.Table)
+
+            self._update_clustering_key(table, cluster_by)
 
         if non_nested_expressions:
             super().alter_table(non_nested_expressions)
@@ -679,7 +745,7 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -847,25 +913,55 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
         # resort to using SQL instead.
         schema = to_schema(schema_name)
         catalog = schema.catalog or self.default_catalog
-        query = exp.select(
-            exp.column("table_catalog").as_("catalog"),
-            exp.column("table_name").as_("name"),
-            exp.column("table_schema").as_("schema_name"),
-            exp.case()
-            .when(exp.column("table_type").eq("BASE TABLE"), exp.Literal.string("TABLE"))
-            .when(exp.column("table_type").eq("CLONE"), exp.Literal.string("TABLE"))
-            .when(exp.column("table_type").eq("EXTERNAL"), exp.Literal.string("TABLE"))
-            .when(exp.column("table_type").eq("SNAPSHOT"), exp.Literal.string("TABLE"))
-            .when(exp.column("table_type").eq("VIEW"), exp.Literal.string("VIEW"))
-            .when(
-                exp.column("table_type").eq("MATERIALIZED VIEW"),
-                exp.Literal.string("MATERIALIZED_VIEW"),
+        query = (
+            exp.select(
+                exp.column("table_catalog").as_("catalog"),
+                exp.column("table_name").as_("name"),
+                exp.column("table_schema").as_("schema_name"),
+                exp.case()
+                .when(exp.column("table_type").eq("BASE TABLE"), exp.Literal.string("TABLE"))
+                .when(exp.column("table_type").eq("CLONE"), exp.Literal.string("TABLE"))
+                .when(exp.column("table_type").eq("EXTERNAL"), exp.Literal.string("TABLE"))
+                .when(exp.column("table_type").eq("SNAPSHOT"), exp.Literal.string("TABLE"))
+                .when(exp.column("table_type").eq("VIEW"), exp.Literal.string("VIEW"))
+                .when(
+                    exp.column("table_type").eq("MATERIALIZED VIEW"),
+                    exp.Literal.string("MATERIALIZED_VIEW"),
+                )
+                .else_(exp.column("table_type"))
+                .as_("type"),
+                exp.column("clustering_key", "ci").as_("clustering_key"),
             )
-            .else_(exp.column("table_type"))
-            .as_("type"),
-        ).from_(
-            exp.to_table(
-                f"`{catalog}`.`{schema.db}`.INFORMATION_SCHEMA.TABLES", dialect=self.dialect
+            .with_(
+                "clustering_info",
+                as_=exp.select(
+                    exp.column("table_catalog"),
+                    exp.column("table_schema"),
+                    exp.column("table_name"),
+                    parse_one(
+                        "string_agg(column_name order by clustering_ordinal_position)",
+                        dialect=self.dialect,
+                    ).as_("clustering_key"),
+                )
+                .from_(
+                    exp.to_table(
+                        f"`{catalog}`.`{schema.db}`.INFORMATION_SCHEMA.COLUMNS",
+                        dialect=self.dialect,
+                    )
+                )
+                .where(exp.column("clustering_ordinal_position").is_(exp.not_(exp.null())))
+                .group_by("1", "2", "3"),
+            )
+            .from_(
+                exp.to_table(
+                    f"`{catalog}`.`{schema.db}`.INFORMATION_SCHEMA.TABLES", dialect=self.dialect
+                )
+            )
+            .join(
+                "clustering_info",
+                using=["table_catalog", "table_schema", "table_name"],
+                join_type="left",
+                join_alias="ci",
             )
         )
         if object_names:
@@ -886,9 +982,46 @@ class BigQueryEngineAdapter(InsertOverwriteWithMergeMixin, ClusteredByMixin):
                 schema=row.schema_name,  # type: ignore
                 name=row.name,  # type: ignore
                 type=DataObjectType.from_str(row.type),  # type: ignore
+                clustering_key=f"({row.clustering_key})" if row.clustering_key else None,  # type: ignore
             )
             for row in df.itertuples()
         ]
+
+    def _change_clustering_key_expr(
+        self, table: exp.Table, cluster_by: t.List[exp.Expression]
+    ) -> exp.Alter:
+        expr = super()._change_clustering_key_expr(table=table, cluster_by=cluster_by)
+        expr.meta[_CLUSTERING_META_KEY] = (table, cluster_by)
+        return expr
+
+    def _drop_clustering_key_expr(self, table: exp.Table) -> exp.Alter:
+        expr = super()._drop_clustering_key_expr(table=table)
+        expr.meta[_CLUSTERING_META_KEY] = (table, None)
+        return expr
+
+    def _update_clustering_key(
+        self, table_name: TableName, cluster_by: t.Optional[t.List[exp.Expression]]
+    ) -> None:
+        cluster_by = cluster_by or []
+        bq_table = self._get_table(table_name)
+
+        rendered_columns = [c.sql(dialect=self.dialect) for c in cluster_by]
+        bq_table.clustering_fields = (
+            rendered_columns or None
+        )  # causes a drop of the key if cluster_by is empty or None
+
+        self._db_call(self.client.update_table, table=bq_table, fields=["clustering_fields"])
+
+        if cluster_by:
+            # BigQuery only applies new clustering going forward, so this rewrites the columns to apply the new clustering to historical data
+            # ref: https://cloud.google.com/bigquery/docs/creating-clustered-tables#modifying-cluster-spec
+            self.execute(exp.update(table_name, {c: c for c in cluster_by}, where=exp.true()))
+
+    def _normalize_decimal_value(self, col: exp.Expression, precision: int) -> exp.Expression:
+        return exp.func("FORMAT", exp.Literal.string(f"%.{precision}f"), col)
+
+    def _normalize_nested_value(self, col: exp.Expression) -> exp.Expression:
+        return exp.func("TO_JSON_STRING", col, dialect=self.dialect)
 
     @property
     def _query_data(self) -> t.Any:
@@ -971,7 +1104,7 @@ def select_partitions_expr(
     """Generates a SQL expression that aggregates partition values for a table.
 
     Args:
-        schema: The schema (BigQueyr dataset) of the table.
+        schema: The schema (BigQuery dataset) of the table.
         table_name: The name of the table.
         data_type: The data type of the partition column.
         granularity: The granularity of the partition. Supported values are: 'day', 'month', 'year' and 'hour'.

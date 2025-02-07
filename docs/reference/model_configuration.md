@@ -8,39 +8,105 @@ Learn more about specifying SQLMesh model properties in the [model concepts over
 
 Configuration options for SQLMesh model properties. Supported by all model kinds other than [`SEED` models](#seed-models).
 
-| Option                | Description                                                                                                                                                                                                                                                                                                                                                 | Type              | Required |
+| Option                | Description                                                                                                                                                                                                                                                                                                                                                 |       Type        | Required |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------:|:--------:|
-| `name`                | The model name. Must include at least a qualifying schema (`<schema>.<model>`) and may include a catalog (`<catalog>.<schema>.<model>`). Can be omitted if [infer_names](#model-naming) is set to true.                                                                                                                                                     | str               | N        |
-| `project`             | The name of the project the model belongs to - used in multi-repo deployments                                                                                                                                                                                                                                                                            | str               | N        |
-| `kind`                | The model kind ([Additional Details](#model-kind-properties)). (Default: `VIEW`)                                                                                                                                                                                                                                                                            | str \| dict       | N        |
-| `audits`              | SQLMesh [audits](../concepts/audits.md) that should run against the model's output                                                                                                                                                                                                                                                                          | array[str]        | N        |
-| `dialect`             | The SQL dialect in which the model's query is written. All SQL dialects [supported by the SQLGlot library](https://github.com/tobymao/sqlglot/blob/main/sqlglot/dialects/dialect.py) are allowed.                                                                                                                                                           | str               | N        |
-| `owner`               | The owner of a model; may be used for notification purposes                                                                                                                                                                                                                                                                                                 | str               | N        |
-| `stamp`               | Arbitrary string used to indicate a model's version without changing the model name                                                                                                                                                                                                                                                                         | str               | N        |
-| `tags`                | Arbitrary strings used to organize or classify a model                                                                                                                                                                                                                                                                                                      | array[str]        | N        |
-| `cron`                | The cron expression specifying how often the model should be refreshed. (Default: `@daily`)                                                                                                                                                                                                                                                                 | str               | N        |
-| `interval_unit`       | The temporal granularity of the model's data intervals. Supported values: `year`, `month`, `day`, `hour`, `half_hour`, `quarter_hour`, `five_minute`. (Default: inferred from `cron`)                                                                                                                                                                       | str               | N        |
-| `start`               | The date/time that determines the earliest date interval that should be processed by a model. Can be a datetime string, epoch time in milliseconds, or a relative datetime such as `1 year ago`. (Default: `yesterday`)                                                                                                                                     | str \| int        | N        |
-| `end`                 | The date/time that determines the latest date interval that should be processed by a model. Can be a datetime string, epoch time in milliseconds, or a relative datetime such as `1 year ago`.                                                                                                                                                              | str \| int        | N        |
-| `description`         | Description of the model. Automatically registered in the SQL engine's table COMMENT field or equivalent (if supported by the engine).                                                                                                                                                                                                                      | str               | N        |
-| `column_descriptions` | A key-value mapping of column names to column comments that will be registered in the SQL engine's table COMMENT field (if supported by the engine). Specified as key-value pairs (`column_name = 'column comment'`). If present, [inline column comments](../concepts/models/overview.md#inline-column-comments) will not be registered in the SQL engine. | dict              | N        |
-| `grains`              | The column(s) whose combination uniquely identifies each row in the model                                                                                                                                                                                                                                                                                   | str \| array[str] | N        |
-| `references`          | The model column(s) used to join to other models' grains                                                                                                                                                                                                                                                                                                    | str \| array[str] | N        |
-| `depends_on`          | Models on which this model depends, in addition to the ones inferred from the model's query. (Default: dependencies inferred from model code)                                                                                                                                                                                                               | array[str]        | N        |
-| `table_format`        | The table format that should be used to manage the physical files (eg `iceberg`, `hive`, `delta`); only applicable to engines such as Spark and Athena                                                                                                                                                                                                      | str               | N        |
-| `storage_format`      | The storage format that should be used to store physical files (eg `parquet`, `orc`); only applicable to engines such as Spark and Athena                                                                                                                                                                                                                   | str               | N        |
-| `partitioned_by`      | The column(s) and/or column expressions used define a model's partitioning key. Required for the `INCREMENTAL_BY_PARTITION` model kind. Optional for all other model kinds; used to partition the model's physical table in engines that support partitioning.                                                                                              | str \| array[str] | N        |
-| `clustered_by`        | The column(s) used to cluster the model's physical table; only applicable to engines that support clustering                                                                                                                                                                                                                                                | str               | N        |
-| `columns`             | The column names and data types returned by the model. Disables [automatic inference of column names and types](../concepts/models/overview.md#conventions) from the SQL query.                                                                                                                                                                             | array[str]        | N        |
-| `physical_properties` | A key-value mapping of arbitrary properties specific to the target engine that are applied to the model table / view in the physical layer. Specified as key-value pairs (`key = value`).                                                                                                                                                                   | dict              | N        |
-| `virtual_properties`  | A key-value mapping of arbitrary properties specific to the target engine that are applied to the model view in the virtual layer. Specified as key-value pairs (`key = value`).                                                                                                                                                                            | dict              | N        |
-| `session_properties`  | A key-value mapping of arbitrary properties specific to the target engine that are applied to the engine session. Specified as key-value pairs (`key = value`).                                                                                                                                                                                             | dict              | N        |
-| `allow_partials`      | Whether this model can process partial (incomplete) data intervals                                                                                                                                                                                                                                                                                          | bool              | N        |
-| `enabled`             | Whether the model is enabled. This attribute is `true` by default. Setting it to `false` causes SQLMesh to ignore this model when loading the project.                                                                                                                                                                                                      | bool              | N        |
+| `name`                | The model name. Must include at least a qualifying schema (`<schema>.<model>`) and may include a catalog (`<catalog>.<schema>.<model>`). Can be omitted if [infer_names](#model-naming) is set to true.                                                                                                                                                     |        str        |    N     |
+| `project`             | The name of the project the model belongs to - used in multi-repo deployments                                                                                                                                                                                                                                                                               |        str        |    N     |
+| `kind`                | The model kind ([Additional Details](#model-kind-properties)). (Default: `VIEW`)                                                                                                                                                                                                                                                                            |    str \| dict    |    N     |
+| `audits`              | SQLMesh [audits](../concepts/audits.md) that should run against the model's output                                                                                                                                                                                                                                                                          |    array[str]     |    N     |
+| `dialect`             | The SQL dialect in which the model's query is written. All SQL dialects [supported by the SQLGlot library](https://github.com/tobymao/sqlglot/blob/main/sqlglot/dialects/dialect.py) are allowed.                                                                                                                                                           |        str        |    N     |
+| `owner`               | The owner of a model; may be used for notification purposes                                                                                                                                                                                                                                                                                                 |        str        |    N     |
+| `stamp`               | Arbitrary string used to indicate a model's version without changing the model name                                                                                                                                                                                                                                                                         |        str        |    N     |
+| `tags`                | Arbitrary strings used to organize or classify a model                                                                                                                                                                                                                                                                                                      |    array[str]     |    N     |
+| `cron`                | The cron expression specifying how often the model should be refreshed. (Default: `@daily`)                                                                                                                                                                                                                                                                 |        str        |    N     |
+| `interval_unit`       | The temporal granularity of the model's data intervals. Supported values: `year`, `month`, `day`, `hour`, `half_hour`, `quarter_hour`, `five_minute`. (Default: inferred from `cron`)                                                                                                                                                                       |        str        |    N     |
+| `start`               | The date/time that determines the earliest date interval that should be processed by a model. Can be a datetime string, epoch time in milliseconds, or a relative datetime such as `1 year ago`. (Default: `yesterday`)                                                                                                                                     |    str \| int     |    N     |
+| `end`                 | The date/time that determines the latest date interval that should be processed by a model. Can be a datetime string, epoch time in milliseconds, or a relative datetime such as `1 year ago`.                                                                                                                                                              |    str \| int     |    N     |
+| `description`         | Description of the model. Automatically registered in the SQL engine's table COMMENT field or equivalent (if supported by the engine).                                                                                                                                                                                                                      |        str        |    N     |
+| `column_descriptions` | A key-value mapping of column names to column comments that will be registered in the SQL engine's table COMMENT field (if supported by the engine). Specified as key-value pairs (`column_name = 'column comment'`). If present, [inline column comments](../concepts/models/overview.md#inline-column-comments) will not be registered in the SQL engine. |       dict        |    N     |
+| `grains`              | The column(s) whose combination uniquely identifies each row in the model                                                                                                                                                                                                                                                                                   | str \| array[str] |    N     |
+| `references`          | The model column(s) used to join to other models' grains                                                                                                                                                                                                                                                                                                    | str \| array[str] |    N     |
+| `depends_on`          | Models on which this model depends, in addition to the ones inferred from the model's query. (Default: dependencies inferred from model code)                                                                                                                                                                                                               |    array[str]     |    N     |
+| `table_format`        | The table format that should be used to manage the physical files (eg `iceberg`, `hive`, `delta`); only applicable to engines such as Spark and Athena                                                                                                                                                                                                      |        str        |    N     |
+| `storage_format`      | The storage format that should be used to store physical files (eg `parquet`, `orc`); only applicable to engines such as Spark and Athena                                                                                                                                                                                                                   |        str        |    N     |
+| `partitioned_by`      | The column(s) and/or column expressions used define a model's partitioning key. Required for the `INCREMENTAL_BY_PARTITION` model kind. Optional for all other model kinds; used to partition the model's physical table in engines that support partitioning.                                                                                              | str \| array[str] |    N     |
+| `clustered_by`        | The column(s) and/or column expressions used to cluster the model's physical table; only applicable to engines that support clustering                                                                                                                                                                                                                                                |        str        |    N     |
+| `columns`             | The column names and data types returned by the model. Disables [automatic inference of column names and types](../concepts/models/overview.md#conventions) from the SQL query.                                                                                                                                                                             |    array[str]     |    N     |
+| `physical_properties` | A key-value mapping of arbitrary properties specific to the target engine that are applied to the model table / view in the physical layer. Specified as key-value pairs (`key = value`). The view/table type (e.g. `TEMPORARY`, `TRANSIENT`) can be added with the `creatable_type` key.                                                                   |       dict        |    N     |
+| `virtual_properties`  | A key-value mapping of arbitrary properties specific to the target engine that are applied to the model view in the virtual layer. Specified as key-value pairs (`key = value`). The view type (e.g. `SECURE`) can be added with the `creatable_type` key.                                                                                                  |       dict        |    N     |
+| `session_properties`  | A key-value mapping of arbitrary properties specific to the target engine that are applied to the engine session. Specified as key-value pairs (`key = value`).                                                                                                                                                                                             |       dict        |    N     |
+| `allow_partials`      | Whether this model can process partial (incomplete) data intervals                                                                                                                                                                                                                                                                                          |       bool        |    N     |
+| `enabled`             | Whether the model is enabled. This attribute is `true` by default. Setting it to `false` causes SQLMesh to ignore this model when loading the project.                                                                                                                                                                                                      |       bool        |    N     |
+| `gateway`             | Specifies the gateway to use for the execution of this model. When not specified, the default gateway is used.                                                                                                                                                                                                       |       str        |    N     |
+| `optimize_query`             | Whether the model's query should be optimized. This attribute is `true` by default. Setting it to `false` causes SQLMesh to disable query canonicalization & simplification. This should be turned off only if the optimized query leads to errors such as surpassing text limit.                                                                                                                                                                                                      |       bool        |    N     |
+| `validate_query`             | Whether the model's query will be strictly validated at compile time. This attribute is `false` by default. Setting it to `true` causes SQLMesh to raise an error instead of emitting warnings. This will display invalid columns in your SQL statements along with models containing `SELECT *` that cannot be automatically expanded to list out all columns.                                                                                                                                                                                              |       bool        |    N     |
 
 ### Model defaults
 
 The SQLMesh project-level configuration must contain the `model_defaults` key and must specify a value for its `dialect` key. Other values are set automatically unless explicitly overridden in the model definition. Learn more about project-level configuration in the [configuration guide](../guides/configuration.md).
+
+In `physical_properties`, `virtual_properties`, and `session_properties`, when both project-level and model-specific properties are defined, they are merged, with model-level properties taking precedence. To unset a project-wide property for a specific model, set it to `None` in the `MODEL`'s DDL properties or within the `@model` decorator for Python models.
+
+For example, with the following `model_defaults` configuration:
+
+=== "YAML"
+
+    ```yaml linenums="1"
+    model_defaults:
+      dialect: snowflake
+      start: 2022-01-01
+      physical_properties:
+        partition_expiration_days: 7
+        require_partition_filter: True
+        project_level_property: "value"
+    ```
+
+=== "Python"
+
+    ```python linenums="1"
+    from sqlmesh.core.config import Config, ModelDefaultsConfig
+
+    config = Config(
+      model_defaults=ModelDefaultsConfig(
+        dialect="snowflake",
+        start="2022-01-01",
+        physical_properties={
+          "partition_expiration_days": 7,
+          "require_partition_filter": True,
+          "project_level_property": "value"
+        },
+      ),
+    )
+    ```
+
+To override `partition_expiration_days`, add a new `creatable_type` property and unset `project_level_property`, you can define the model as follows:
+
+=== "SQL"
+
+    ```sql linenums="1"
+    MODEL (
+      ...,
+      physical_properties (
+        partition_expiration_days = 14,
+        creatable_type = TRANSIENT,
+        project_level_property = None,
+      )
+    );
+    ```
+
+=== "Python"
+
+    ```python linenums="1"
+    @model(
+      ...,
+      physical_properties={
+        "partition_expiration_days": 14,
+        "creatable_type": "TRANSIENT",
+        "project_level_property": None
+      },
+    )
+    ```
+
 
 The SQLMesh project-level `model_defaults` key supports the following options, described in the [general model properties](#general-model-properties) table above:
 
@@ -49,19 +115,24 @@ The SQLMesh project-level `model_defaults` key supports the following options, d
 - cron
 - owner
 - start
+- table_format
 - storage_format
+- physical_properties
+- virtual_properties
 - session_properties (on per key basis)
 - on_destructive_change (described [below](#incremental-models))
 - audits (described [here](../concepts/audits.md#generic-audits))
+- optimize_query
+- validate_query
 
 
 ### Model Naming
 
 Configuration option for name inference. Learn more in the [model naming guide](../guides/configuration.md#model-naming).
 
-| Option          | Description                                                                             |  Type   | Required |
-| --------------- | --------------------------------------------------------------------------------------- | :-----: | :------: |
-| `infer_names`   | Whether to automatically infer model names based on the directory structure (Default: `False`) | bool |    N     |
+| Option        | Description                                                                                    | Type | Required |
+|---------------|------------------------------------------------------------------------------------------------|:----:|:--------:|
+| `infer_names` | Whether to automatically infer model names based on the directory structure (Default: `False`) | bool |    N     |
 
 
 ## Model kind properties
@@ -75,7 +146,7 @@ Learn more about model kinds at the [model kind concepts page](../concepts/model
 Configuration options for models of the [`VIEW` kind](../concepts/models/model_kinds.md#view) (in addition to [general model properties](#general-model-properties)).
 
 | Option         | Description                                                                                          | Type | Required |
-| -------------- | ---------------------------------------------------------------------------------------------------- | :--: | :------: |
+|----------------|------------------------------------------------------------------------------------------------------|:----:|:--------:|
 | `materialized` | Whether views should be materialized (for engines supporting materialized views). (Default: `False`) | bool |    N     |
 
 Python model kind `name` enum value: [ModelKindName.VIEW](https://sqlmesh.readthedocs.io/en/stable/_readthedocs/html/sqlmesh/core/model/kind.html#ModelKindName)
@@ -101,12 +172,12 @@ Configuration options for all incremental models (in addition to [general model 
 Configuration options for [`INCREMENTAL_BY_TIME_RANGE` models](../concepts/models/model_kinds.md#incremental_by_time_range) (in addition to [general model properties](#general-model-properties) and [incremental model properties](#incremental-models)).
 
 | Option              | Description                                                                                                                                                                                                                                                                                                                      | Type | Required |
-|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----:|:--------:|
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--: | :------: |
 | `time_column`       | The model column containing each row's timestamp. Should be UTC time zone.                                                                                                                                                                                                                                                       | str  |    Y     |
 | `format`            | Argument to `time_column`. Format of the time column's data. (Default: `%Y-%m-%d`)                                                                                                                                                                                                                                               | str  |    N     |
 | `batch_size`        | The maximum number of intervals that can be evaluated in a single backfill task. If this is `None`, all intervals will be processed as part of a single task. If this is set, a model's backfill will be chunked such that each individual task only contains jobs with the maximum of `batch_size` intervals. (Default: `None`) | int  |    N     |
 | `batch_concurrency` | The maximum number of batches that can run concurrently for this model. (Default: the number of concurrent tasks set in the connection settings)                                                                                                                                                                                 | int  |    N     |
-| `lookback`          | The number of time unit intervals prior to the current interval that should be processed. (Default: `0`)                                                                                                                                                                                                                         | int  |    N     |
+| `lookback`          | The number of `interval_unit`s prior to the current interval that should be processed - [learn more](../concepts/models/overview.md#lookback). (Default: `0`)                                                                                                                                                                                                        | int  |    N     |
 
 Python model kind `name` enum value: [ModelKindName.INCREMENTAL_BY_TIME_RANGE](https://sqlmesh.readthedocs.io/en/stable/_readthedocs/html/sqlmesh/core/model/kind.html#ModelKindName)
 
@@ -118,6 +189,7 @@ Configuration options for [`INCREMENTAL_BY_UNIQUE_KEY` models](../concepts/model
 |----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|----------|
 | `unique_key`   | The model column(s) containing each row's unique key                                                                                                                                                                                                                                                                             | str \| array[str] | Y        |
 | `when_matched` | SQL logic used to update columns when a match occurs - only available on engines that support `MERGE`. (Default: update all columns)                                                                                                                                                                                             | str               | N        |
+| `merge_filter` | A single or a conjunction of predicates used to filter data in the ON clause of a MERGE operation - only available on engines that support `MERGE`                                                                                                                                                                               | str               | N        |
 | `batch_size`   | The maximum number of intervals that can be evaluated in a single backfill task. If this is `None`, all intervals will be processed as part of a single task. If this is set, a model's backfill will be chunked such that each individual task only contains jobs with the maximum of `batch_size` intervals. (Default: `None`) | int               | N        |
 | `lookback`     | The number of time unit intervals prior to the current interval that should be processed. (Default: `0`)                                                                                                                                                                                                                         | int               | N        |
 

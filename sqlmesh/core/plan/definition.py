@@ -37,6 +37,7 @@ class Plan(PydanticModel, frozen=True):
 
     is_dev: bool
     skip_backfill: bool
+    empty_backfill: bool
     no_gaps: bool
     forward_only: bool
     allow_destructive_models: t.Set[str]
@@ -49,7 +50,6 @@ class Plan(PydanticModel, frozen=True):
 
     directly_modified: t.Set[SnapshotId]
     indirectly_modified: t.Dict[SnapshotId, t.Set[SnapshotId]]
-    ignored: t.Set[SnapshotId]
 
     deployability_index: DeployabilityIndex
     restatements: t.Dict[SnapshotId, Interval]
@@ -83,20 +83,15 @@ class Plan(PydanticModel, frozen=True):
 
     @property
     def requires_backfill(self) -> bool:
-        return not self.skip_backfill and (bool(self.restatements) or bool(self.missing_intervals))
+        return (
+            not self.skip_backfill
+            and not self.empty_backfill
+            and (bool(self.restatements) or bool(self.missing_intervals))
+        )
 
     @property
     def has_changes(self) -> bool:
-        modified_snapshot_ids = {
-            *self.context_diff.added,
-            *self.context_diff.removed_snapshots,
-            *self.context_diff.current_modified_snapshot_ids,
-        } - self.ignored
-        return (
-            self.context_diff.is_new_environment
-            or self.context_diff.is_unfinalized_environment
-            or bool(modified_snapshot_ids)
-        )
+        return self.context_diff.has_changes
 
     @property
     def has_unmodified_unpromoted(self) -> bool:
@@ -113,7 +108,7 @@ class Plan(PydanticModel, frozen=True):
         """Returns the already categorized snapshots."""
         return [
             self.context_diff.snapshots[s_id]
-            for s_id in sorted(self.directly_modified)
+            for s_id in sorted({*self.directly_modified, *self.metadata_updated})
             if self.context_diff.snapshots[s_id].version
         ]
 
@@ -126,11 +121,9 @@ class Plan(PydanticModel, frozen=True):
             if not self.context_diff.snapshots[s_id].version
         ]
 
-    @cached_property
+    @property
     def snapshots(self) -> t.Dict[SnapshotId, Snapshot]:
-        return {
-            s_id: s for s_id, s in self.context_diff.snapshots.items() if s_id not in self.ignored
-        }
+        return self.context_diff.snapshots
 
     @cached_property
     def modified_snapshots(self) -> t.Dict[SnapshotId, t.Union[Snapshot, SnapshotTableInfo]]:
@@ -143,14 +136,21 @@ class Plan(PydanticModel, frozen=True):
                 for s_id in sorted(downstream_s_ids)
             },
             **self.context_diff.removed_snapshots,
+            **{s_id: self.context_diff.snapshots[s_id] for s_id in sorted(self.metadata_updated)},
+        }
+
+    @cached_property
+    def metadata_updated(self) -> t.Set[SnapshotId]:
+        return {
+            snapshot.snapshot_id
+            for snapshot, _ in self.context_diff.modified_snapshots.values()
+            if self.context_diff.metadata_updated(snapshot.name)
         }
 
     @property
     def new_snapshots(self) -> t.List[Snapshot]:
         """Gets only new snapshots in the plan/environment."""
-        return [
-            s for s in self.context_diff.new_snapshots.values() if s.snapshot_id not in self.ignored
-        ]
+        return list(self.context_diff.new_snapshots.values())
 
     @property
     def missing_intervals(self) -> t.List[SnapshotIntervals]:
@@ -218,13 +218,14 @@ class Plan(PydanticModel, frozen=True):
             expiration_ts=expiration_ts,
             promoted_snapshot_ids=promoted_snapshot_ids,
             previous_finalized_snapshots=previous_finalized_snapshots,
+            requirements=self.context_diff.requirements,
             **self.environment_naming_info.dict(),
         )
 
     def is_new_snapshot(self, snapshot: Snapshot) -> bool:
         """Returns True if the given snapshot is a new snapshot in this plan."""
         snapshot_id = snapshot.snapshot_id
-        return snapshot_id in self.context_diff.new_snapshots and snapshot_id not in self.ignored
+        return snapshot_id in self.context_diff.new_snapshots
 
     def is_selected_for_backfill(self, model_fqn: str) -> bool:
         """Returns True if a model with the given FQN should be backfilled as part of this plan."""
@@ -238,6 +239,7 @@ class Plan(PydanticModel, frozen=True):
             environment=self.environment,
             no_gaps=self.no_gaps,
             skip_backfill=self.skip_backfill,
+            empty_backfill=self.empty_backfill,
             restatements={s.name: i for s, i in self.restatements.items()},
             is_dev=self.is_dev,
             allow_destructive_models=self.allow_destructive_models,
@@ -269,6 +271,7 @@ class EvaluatablePlan(PydanticModel):
     environment: Environment
     no_gaps: bool
     skip_backfill: bool
+    empty_backfill: bool
     restatements: t.Dict[str, Interval]
     is_dev: bool
     allow_destructive_models: t.Set[str]
@@ -289,6 +292,10 @@ class EvaluatablePlan(PydanticModel):
     @property
     def plan_id(self) -> str:
         return self.environment.plan_id
+
+    @property
+    def is_prod(self) -> bool:
+        return not self.is_dev
 
 
 class PlanStatus(str, Enum):

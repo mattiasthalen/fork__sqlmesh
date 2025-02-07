@@ -17,12 +17,15 @@ from sqlglot import exp
 
 from sqlmesh.utils import ttl_cache
 
+if t.TYPE_CHECKING:
+    from sqlglot.dialects.dialect import DialectType
+
 UTC = timezone.utc
 TimeLike = t.Union[date, datetime, str, int, float]
+DatetimeRange = t.Tuple[datetime, datetime]
+DatetimeRanges = t.List[DatetimeRange]
 DATE_INT_FMT = "%Y%m%d"
 
-if t.TYPE_CHECKING:
-    from sqlmesh.core.scheduler import Interval
 
 warnings.filterwarnings(
     "ignore",
@@ -179,7 +182,13 @@ def to_datetime(
                 expression
             ):
                 relative_base = relative_base.replace(hour=0, minute=0, second=0, microsecond=0)
-            dt = dateparser.parse(expression, settings={"RELATIVE_BASE": relative_base})
+
+            # note: we hardcode TIMEZONE: UTC to work around this bug: https://github.com/scrapinghub/dateparser/issues/896
+            # where dateparser just silently fails if it cant interpret the contents of /etc/localtime
+            # this works because SQLMesh only deals with UTC, there is no concept of user local time
+            dt = dateparser.parse(
+                expression, settings={"RELATIVE_BASE": relative_base, "TIMEZONE": "UTC"}
+            )
         else:
             try:
                 dt = datetime.strptime(str(value), DATE_INT_FMT)
@@ -210,8 +219,10 @@ def to_date(value: TimeLike, relative_base: t.Optional[datetime] = None) -> date
 
 
 def date_dict(
-    execution_time: TimeLike, start: t.Optional[TimeLike], end: t.Optional[TimeLike]
-) -> t.Dict[str, t.Union[str, datetime, date, float, int]]:
+    execution_time: TimeLike,
+    start: t.Optional[TimeLike],
+    end: t.Optional[TimeLike],
+) -> t.Dict[str, TimeLike]:
     """Creates a kwarg dictionary of datetime variables for use in SQL Contexts.
 
     Keys are like start_date, start_ds, end_date, end_ds...
@@ -278,7 +289,9 @@ def is_date(obj: TimeLike) -> bool:
         return False
 
 
-def make_inclusive(start: TimeLike, end: TimeLike) -> Interval:
+def make_inclusive(
+    start: TimeLike, end: TimeLike, dialect: t.Optional[DialectType] = ""
+) -> DatetimeRange:
     """Adjust start and end times to to become inclusive datetimes.
 
     SQLMesh treats start and end times as inclusive so that filters can be written as
@@ -289,7 +302,8 @@ def make_inclusive(start: TimeLike, end: TimeLike) -> Interval:
     In the ds ('2020-01-01') case, because start_ds and end_ds are categorical, between works even if
     start_ds and end_ds are equivalent. However, when we move to ts ('2022-01-01 12:00:00'), because timestamps
     are numeric, using simple equality doesn't make sense. When the end is not a categorical date, then it is
-    treated as an exclusive range and converted to inclusive by subtracting 1 millisecond.
+    treated as an exclusive range and converted to inclusive by subtracting 1 microsecond. If the dialect is
+    T-SQL then 1 nanoseconds is subtracted to account for the increased precision.
 
     Args:
         start: Start timelike object.
@@ -302,11 +316,14 @@ def make_inclusive(start: TimeLike, end: TimeLike) -> Interval:
     Returns:
         A tuple of inclusive datetime objects.
     """
-    return (to_datetime(start), make_inclusive_end(end))
+    return (to_datetime(start), make_inclusive_end(end, dialect=dialect))
 
 
-def make_inclusive_end(end: TimeLike) -> datetime:
-    return make_exclusive(end) - timedelta(microseconds=1)
+def make_inclusive_end(end: TimeLike, dialect: t.Optional[DialectType] = "") -> datetime:
+    exclusive_end = make_exclusive(end)
+    if dialect == "tsql":
+        return to_utc_timestamp(exclusive_end) - pd.Timedelta(1, unit="ns")
+    return exclusive_end - timedelta(microseconds=1)
 
 
 def make_exclusive(time: TimeLike) -> datetime:
@@ -314,6 +331,12 @@ def make_exclusive(time: TimeLike) -> datetime:
     if is_date(time):
         dt = dt + timedelta(days=1)
     return dt
+
+
+def to_utc_timestamp(time: datetime) -> pd.Timestamp:
+    if time.tzinfo is not None:
+        return pd.Timestamp(time).tz_convert("utc")
+    return pd.Timestamp(time, tz="utc")
 
 
 def validate_date_range(
@@ -346,12 +369,36 @@ def is_categorical_relative_expression(expression: str) -> bool:
 def to_time_column(
     time_column: t.Union[TimeLike, exp.Null],
     time_column_type: exp.DataType,
+    dialect: str,
     time_column_format: t.Optional[str] = None,
+    nullable: bool = False,
 ) -> exp.Expression:
     """Convert a TimeLike object to the same time format and type as the model's time column."""
+    if dialect == "clickhouse" and time_column_type.is_type(
+        *(exp.DataType.TEMPORAL_TYPES - {exp.DataType.Type.DATE, exp.DataType.Type.DATE32})
+    ):
+        if time_column_type.is_type(exp.DataType.Type.DATETIME64):
+            if nullable:
+                time_column_type.set("nullable", nullable)
+        else:
+            # Clickhouse will error if we pass fractional seconds to DateTime, so we always
+            # use DateTime64 for timestamps.
+            #
+            # `datetime` objects have microsecond precision, so we specify the type precision as 6.
+            # If a timezone is present in the passed type object, it is included in the DateTime64 type
+            # via the `expressions` arg.
+            time_column_type = exp.DataType.build(
+                exp.DataType.Type.DATETIME64,
+                expressions=[
+                    exp.DataTypeParam(this=exp.Literal(this=6, is_string=False)),
+                    *time_column_type.expressions,
+                ],
+                nullable=nullable or time_column_type.args.get("nullable", False),
+            )
+
     if isinstance(time_column, exp.Null):
         return exp.cast(time_column, to=time_column_type)
-    if time_column_type.is_type(exp.DataType.Type.DATE):
+    if time_column_type.is_type(exp.DataType.Type.DATE, exp.DataType.Type.DATE32):
         return exp.cast(exp.Literal.string(to_ds(time_column)), to="date")
     if time_column_type.is_type(*TEMPORAL_TZ_TYPES):
         return exp.cast(exp.Literal.string(to_tstz(time_column)), to=time_column_type)
@@ -386,3 +433,19 @@ def pandas_timestamp_to_pydatetime(
                 )
 
     return df
+
+
+def format_tz_datetime(
+    time: TimeLike,
+    format_string: t.Optional[str] = "%Y-%m-%d %I:%M%p %Z",
+    use_local_timezone: bool = False,
+) -> str:
+    output_datetime = to_datetime(time)
+    if use_local_timezone:
+        local_timezone = datetime.now().astimezone().tzinfo
+        output_datetime = output_datetime.astimezone(local_timezone)
+    return (
+        output_datetime.strftime(format_string)
+        if format_string
+        else output_datetime.isoformat(sep=" ")
+    )

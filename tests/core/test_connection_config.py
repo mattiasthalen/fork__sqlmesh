@@ -1,4 +1,5 @@
 import base64
+import re
 import typing as t
 
 import pytest
@@ -8,12 +9,14 @@ from sqlmesh.core.config.connection import (
     BigQueryConnectionConfig,
     ClickhouseConnectionConfig,
     ConnectionConfig,
+    DatabricksConnectionConfig,
     DuckDBAttachOptions,
     DuckDBConnectionConfig,
     GCPPostgresConnectionConfig,
     MySQLConnectionConfig,
     PostgresConnectionConfig,
     SnowflakeConnectionConfig,
+    TrinoConnectionConfig,
     TrinoAuthenticationMethod,
     AthenaConnectionConfig,
     _connection_config_validator,
@@ -387,6 +390,35 @@ def test_trino(make_config):
         make_config(method="ldap", http_scheme="http", **required_kwargs)
 
 
+def test_trino_schema_location_mapping(make_config):
+    required_kwargs = dict(
+        type="trino",
+        user="user",
+        host="host",
+        catalog="catalog",
+    )
+
+    with pytest.raises(
+        ConfigError, match=r".*needs to include the '@\{schema_name\}' placeholder.*"
+    ):
+        make_config(**required_kwargs, schema_location_mapping={".*": "s3://foo"})
+
+    config: TrinoConnectionConfig = make_config(
+        **required_kwargs,
+        schema_location_mapping={
+            "^utils$": "s3://utils-bucket/@{schema_name}",
+            "^staging.*$": "s3://bucket/@{schema_name}_dev",
+            "^sqlmesh.*$": "s3://sqlmesh-internal/dev/@{schema_name}",
+        },
+    )
+
+    assert config.schema_location_mapping is not None
+    assert len(config.schema_location_mapping) == 3
+
+    assert all((isinstance(k, re.Pattern) for k in config.schema_location_mapping))
+    assert all((isinstance(v, str) for v in config.schema_location_mapping.values()))
+
+
 def test_duckdb(make_config):
     config = make_config(
         type="duckdb",
@@ -394,7 +426,7 @@ def test_duckdb(make_config):
         connector_config={"foo": "bar"},
     )
     assert isinstance(config, DuckDBConnectionConfig)
-    assert config.is_recommended_for_state_sync is True
+    assert not config.is_recommended_for_state_sync
 
 
 @pytest.mark.parametrize(
@@ -555,7 +587,7 @@ def test_duckdb_attach_catalog(make_config):
 
     assert config.catalogs.get("test2").read_only is False
     assert config.catalogs.get("test2").path == "test2.duckdb"
-    assert config.is_recommended_for_state_sync is True
+    assert not config.is_recommended_for_state_sync
 
 
 def test_duckdb_attach_options():
@@ -571,6 +603,47 @@ def test_duckdb_attach_options():
     options = DuckDBAttachOptions(type="duckdb", path="test.db", read_only=False)
 
     assert options.to_sql(alias="db") == "ATTACH 'test.db' AS db"
+
+
+def test_duckdb_multithreaded_connection_factory(make_config):
+    from sqlmesh.core.engine_adapter import DuckDBEngineAdapter
+    from sqlmesh.utils.connection_pool import ThreadLocalConnectionPool
+    from threading import Thread
+
+    config = make_config(type="duckdb")
+
+    # defaults to 1, no issue
+    assert config.concurrent_tasks == 1
+
+    # check that the connection factory always returns the same connection in multithreaded mode
+    # this sounds counter-intuitive but that's what DuckDB recommends here: https://duckdb.org/docs/guides/python/multiple_threads.html
+    config = make_config(type="duckdb", concurrent_tasks=8)
+    adapter = config.create_engine_adapter()
+    assert isinstance(adapter, DuckDBEngineAdapter)
+    assert isinstance(adapter._connection_pool, ThreadLocalConnectionPool)
+
+    threads = []
+    connection_objects = []
+
+    def _thread_connection():
+        connection_objects.append(adapter.connection)
+
+    for _ in range(8):
+        threads.append(Thread(target=_thread_connection))
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    assert len(connection_objects) == 8
+    assert len(set(connection_objects)) == 1  # they should all be the same object
+
+    # test that recycling the pool means we dont end up with unusable connections (eg check we havent cached a closed connection)
+    assert adapter.fetchone("select 1") == (1,)
+    adapter.recycle()
+    assert adapter.fetchone("select 1") == (1,)
 
 
 def test_bigquery(make_config):
@@ -681,6 +754,21 @@ def test_athena(make_config):
     assert isinstance(config, AthenaConnectionConfig)
 
 
+def test_athena_catalog(make_config):
+    config = make_config(type="athena", work_group="primary", catalog_name="foo")
+    assert isinstance(config, AthenaConnectionConfig)
+
+    assert config.catalog_name == "foo"
+    adapter = config.create_engine_adapter()
+    assert adapter.default_catalog == "foo"
+
+    config = make_config(type="athena", work_group="primary")
+    assert isinstance(config, AthenaConnectionConfig)
+    assert config.catalog_name is None
+    adapter = config.create_engine_adapter()
+    assert adapter.default_catalog == "awsdatacatalog"
+
+
 def test_athena_s3_staging_dir_or_workgroup(make_config):
     with pytest.raises(
         ConfigError, match=r"At least one of work_group or s3_staging_dir must be set"
@@ -726,3 +814,75 @@ def test_athena_s3_locations_valid(make_config):
     assert isinstance(config, AthenaConnectionConfig)
     assert config.s3_staging_dir is None
     assert config.s3_warehouse_location is None
+
+
+def test_databricks(make_config):
+    # Personal Access Token
+    oauth_pat_config = make_config(
+        type="databricks",
+        server_hostname="dbc-test.cloud.databricks.com",
+        http_path="sql/test/foo",
+        access_token="foo",
+    )
+    assert isinstance(oauth_pat_config, DatabricksConnectionConfig)
+    assert oauth_pat_config.server_hostname == "dbc-test.cloud.databricks.com"
+    assert oauth_pat_config.http_path == "sql/test/foo"
+    assert oauth_pat_config.access_token == "foo"
+    assert oauth_pat_config.auth_type is None
+    assert oauth_pat_config.oauth_client_id is None
+    assert oauth_pat_config.oauth_client_secret is None
+
+    # OAuth (M2M)
+    oauth_m2m_config = make_config(
+        type="databricks",
+        server_hostname="dbc-test.cloud.databricks.com",
+        http_path="sql/test/foo",
+        auth_type="databricks-oauth",
+        oauth_client_id="client-id",
+        oauth_client_secret="client-secret",
+    )
+    assert isinstance(oauth_m2m_config, DatabricksConnectionConfig)
+    assert oauth_m2m_config.server_hostname == "dbc-test.cloud.databricks.com"
+    assert oauth_pat_config.http_path == "sql/test/foo"
+    assert oauth_m2m_config.access_token is None
+    assert oauth_m2m_config.auth_type == "databricks-oauth"
+    assert oauth_m2m_config.oauth_client_id == "client-id"
+    assert oauth_m2m_config.oauth_client_secret == "client-secret"
+
+    # OAuth (U2M)
+    oauth_u2m_config = make_config(
+        type="databricks",
+        server_hostname="dbc-test.cloud.databricks.com",
+        http_path="sql/test/foo",
+        auth_type="databricks-oauth",
+    )
+    assert isinstance(oauth_u2m_config, DatabricksConnectionConfig)
+    assert oauth_u2m_config.server_hostname == "dbc-test.cloud.databricks.com"
+    assert oauth_pat_config.http_path == "sql/test/foo"
+    assert oauth_u2m_config.access_token is None
+    assert oauth_u2m_config.auth_type == "databricks-oauth"
+    assert oauth_u2m_config.oauth_client_id is None
+    assert oauth_u2m_config.oauth_client_secret is None
+
+    # auth_type must match the AuthType enum if specified
+    with pytest.raises(ValueError, match=r".*nonexist does not match a valid option.*"):
+        make_config(
+            type="databricks", server_hostname="dbc-test.cloud.databricks.com", auth_type="nonexist"
+        )
+
+    # if client_secret is specified, client_id must also be specified
+    with pytest.raises(ValueError, match=r"`oauth_client_id` is required.*"):
+        make_config(
+            type="databricks",
+            server_hostname="dbc-test.cloud.databricks.com",
+            auth_type="databricks-oauth",
+            oauth_client_secret="client-secret",
+        )
+
+    # http_path is still required when auth_type is specified
+    with pytest.raises(ValueError, match=r"`http_path` is still required.*"):
+        make_config(
+            type="databricks",
+            server_hostname="dbc-test.cloud.databricks.com",
+            auth_type="databricks-oauth",
+        )

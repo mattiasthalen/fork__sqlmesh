@@ -145,7 +145,7 @@ def test_comments(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture)
     assert sql_calls == [
         """CREATE TABLE IF NOT EXISTS "test_table" ("a" INT COMMENT 'a column description', "b" INT) COMMENT='table description'""",
         """CREATE TABLE IF NOT EXISTS "test_table" ("a" INT COMMENT 'a column description', "b" INT) COMMENT='table description' AS SELECT CAST("a" AS INT) AS "a", CAST("b" AS INT) AS "b" FROM (SELECT "a", "b" FROM "source_table") AS "_subquery\"""",
-        """CREATE OR REPLACE VIEW "test_view" COMMENT='table description' AS SELECT "a", "b" FROM "source_table\"""",
+        """CREATE OR REPLACE VIEW "test_view" COPY GRANTS COMMENT='table description' AS SELECT "a", "b" FROM "source_table\"""",
         """ALTER VIEW "test_view" ALTER COLUMN "a" COMMENT 'a column description'""",
         """COMMENT ON TABLE "test_table" IS 'table description'""",
         """ALTER TABLE "test_table" ALTER COLUMN "a" COMMENT 'a column description'""",
@@ -175,7 +175,7 @@ def test_multiple_column_comments(make_mocked_engine_adapter: t.Callable, mocker
     sql_calls = to_sql_calls(adapter)
     assert sql_calls == [
         """CREATE TABLE IF NOT EXISTS "test_table" ("a" INT COMMENT 'a column description', "b" INT COMMENT 'b column description')""",
-        """CREATE OR REPLACE VIEW "test_view" AS SELECT "a", "b" FROM "test_table\"""",
+        """CREATE OR REPLACE VIEW "test_view" COPY GRANTS AS SELECT "a", "b" FROM "test_table\"""",
         """ALTER VIEW "test_view" ALTER COLUMN "a" COMMENT 'a column description', COLUMN "b" COMMENT 'b column description'""",
         """ALTER TABLE "test_table" ALTER COLUMN "a" COMMENT 'a column description changed', COLUMN "b" COMMENT 'b column description changed'""",
     ]
@@ -253,7 +253,7 @@ def test_create_managed_table(make_mocked_engine_adapter: t.Callable, mocker: Mo
         table_properties={
             "target_lag": exp.Literal.string("20 minutes"),
         },
-        clustered_by=["a"],
+        clustered_by=[exp.column("a")],
         partitioned_by=["b"],
     )
 
@@ -429,7 +429,7 @@ def test_replace_query_snowpark_dataframe(
     ]
 
 
-def test_materialized_view_properties(make_mocked_engine_adapter: t.Callable):
+def test_creatable_type_materialized_view_properties(make_mocked_engine_adapter: t.Callable):
     adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
 
     adapter.create_view(
@@ -439,7 +439,7 @@ def test_materialized_view_properties(make_mocked_engine_adapter: t.Callable):
         materialized_properties={
             # Partitioned by is not supported so we are confirming it is ignored
             "partitioned_by": [exp.column("ds")],
-            "clustered_by": ["a"],
+            "clustered_by": [exp.column("a")],
             "partition_interval_unit": IntervalUnit.DAY,
         },
     )
@@ -447,5 +447,190 @@ def test_materialized_view_properties(make_mocked_engine_adapter: t.Callable):
     sql_calls = to_sql_calls(adapter)
     # https://docs.snowflake.com/en/sql-reference/sql/create-materialized-view#syntax
     assert sql_calls == [
-        'CREATE OR REPLACE MATERIALIZED VIEW "test_table" CLUSTER BY ("a") AS SELECT 1',
+        'CREATE OR REPLACE MATERIALIZED VIEW "test_table" COPY GRANTS CLUSTER BY ("a") AS SELECT 1',
+    ]
+
+
+def test_creatable_type_secure_view(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_view(
+        "test_table",
+        parse_one("SELECT 1"),
+        view_properties={
+            "creatable_type": exp.Column(this=exp.Identifier(this="secure")),
+        },
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    # https://docs.snowflake.com/en/sql-reference/sql/create-view.html
+    assert sql_calls == [
+        'CREATE OR REPLACE SECURE VIEW "test_table" COPY GRANTS AS SELECT 1',
+    ]
+
+
+def test_creatable_type_secure_materialized_view(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_view(
+        "test_table",
+        parse_one("SELECT 1"),
+        materialized=True,
+        view_properties={
+            "creatable_type": exp.Column(this=exp.Identifier(this="secure")),
+        },
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    # https://docs.snowflake.com/en/sql-reference/sql/create-view.html
+    assert sql_calls == [
+        'CREATE OR REPLACE SECURE MATERIALIZED VIEW "test_table" COPY GRANTS AS SELECT 1',
+    ]
+
+
+def test_creatable_type_temporary_view(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_view(
+        "test_table",
+        parse_one("SELECT 1"),
+        view_properties={
+            "creatable_type": exp.column("temporary"),
+        },
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE OR REPLACE TEMPORARY VIEW "test_table" COPY GRANTS AS SELECT 1',
+    ]
+
+
+def test_creatable_type_temporary_table(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_table(
+        "test_table",
+        {"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")},
+        table_properties={
+            "creatable_type": exp.column("temporary"),
+        },
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE TEMPORARY TABLE IF NOT EXISTS "test_table" ("a" INT, "b" INT)',
+    ]
+
+
+def test_creatable_type_transient_table(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_table(
+        "test_table",
+        {"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")},
+        table_properties={
+            "creatable_type": exp.column("transient"),
+        },
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE TRANSIENT TABLE IF NOT EXISTS "test_table" ("a" INT, "b" INT)',
+    ]
+
+
+def test_creatable_type_materialize_creatable_type_raise_error(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    with pytest.raises(SQLMeshError):
+        adapter.create_view(
+            "test_view",
+            parse_one("SELECT 1"),
+            view_properties={
+                "creatable_type": exp.column("materialized"),
+            },
+        )
+
+
+def test_creatable_type_transient_type_from_model_definition(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    model: SqlModel = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            d.parse(
+                """
+MODEL (
+    name external.test.table,
+    kind full,
+    physical_properties (
+        creatable_type = transient
+    )
+);
+SELECT a::INT;
+    """
+            )
+        ),
+    )
+    adapter.create_table(
+        model.name,
+        columns_to_types=model.columns_to_types_or_raise,
+        table_properties=model.physical_properties,
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE TRANSIENT TABLE IF NOT EXISTS "external"."test"."table" ("a" INT)',
+    ]
+
+
+def test_creatable_type_transient_type_from_model_definition_with_other_property(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    model: SqlModel = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            d.parse(
+                """
+MODEL (
+    name external.test.table,
+    kind full,
+    physical_properties (
+        creatable_type = transient,
+        require_partition_filter = true
+    )
+);
+SELECT a::INT;
+    """
+            )
+        ),
+    )
+    adapter.create_table(
+        model.name,
+        columns_to_types=model.columns_to_types_or_raise,
+        table_properties=model.physical_properties,
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE TRANSIENT TABLE IF NOT EXISTS "external"."test"."table" ("a" INT) REQUIRE_PARTITION_FILTER=TRUE'
+    ]
+
+
+def test_create_view(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    adapter.create_view("test_view", parse_one("SELECT 1"))
+    adapter.create_view("test_view", parse_one("SELECT 1"), replace=False)
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'CREATE OR REPLACE VIEW "test_view" COPY GRANTS AS SELECT 1',
+        'CREATE VIEW "test_view" AS SELECT 1',
     ]

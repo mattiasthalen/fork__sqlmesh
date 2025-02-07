@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import logging
 import typing as t
 
 import pandas as pd
 from sqlglot import exp
 
 from sqlmesh.core.dialect import to_schema
+from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
 from sqlmesh.core.engine_adapter.base_postgres import BasePostgresEngineAdapter
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
-    LogicalMergeMixin,
     NonTransactionalTruncateMixin,
     VarcharSizeWorkaroundMixin,
+    RowDiffMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CommentCreationView,
@@ -21,19 +23,22 @@ from sqlmesh.core.engine_adapter.shared import (
     set_catalog,
 )
 from sqlmesh.core.schema_diff import SchemaDiffer
+from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
-    from sqlmesh.core.engine_adapter.base import QueryOrDF
+    from sqlmesh.core.engine_adapter.base import QueryOrDF, Query
+
+logger = logging.getLogger(__name__)
 
 
 @set_catalog()
 class RedshiftEngineAdapter(
     BasePostgresEngineAdapter,
-    LogicalMergeMixin,
     GetCurrentCatalogFromFunctionMixin,
     NonTransactionalTruncateMixin,
     VarcharSizeWorkaroundMixin,
+    RowDiffMixin,
 ):
     DIALECT = "redshift"
     CURRENT_CATALOG_EXPRESSION = exp.func("current_database")
@@ -53,17 +58,67 @@ class RedshiftEngineAdapter(
             exp.DataType.build("CHAR", dialect=DIALECT).this: 4096,
             exp.DataType.build("VARCHAR", dialect=DIALECT).this: 65535,
         },
+        drop_cascade=True,
     )
+    VARIABLE_LENGTH_DATA_TYPES = {
+        "char",
+        "character",
+        "nchar",
+        "varchar",
+        "character varying",
+        "nvarchar",
+        "varbyte",
+        "varbinary",
+        "binary varying",
+    }
 
-    def _columns_query(self, table: exp.Table) -> exp.Select:
+    def columns(
+        self,
+        table_name: TableName,
+        include_pseudo_columns: bool = True,
+    ) -> t.Dict[str, exp.DataType]:
+        table = exp.to_table(table_name)
+
         sql = (
-            exp.select("column_name", "data_type")
+            exp.select(
+                "column_name",
+                "data_type",
+                "character_maximum_length",
+                "numeric_precision",
+                "numeric_scale",
+            )
             .from_("svv_columns")  # Includes late-binding views
             .where(exp.column("table_name").eq(table.alias_or_name))
         )
         if table.args.get("db"):
             sql = sql.where(exp.column("table_schema").eq(table.args["db"].name))
-        return sql
+
+        columns_raw = self.fetchall(sql, quote_identifiers=True)
+
+        def build_var_length_col(
+            column_name: str,
+            data_type: str,
+            character_maximum_length: t.Optional[int] = None,
+            numeric_precision: t.Optional[int] = None,
+            numeric_scale: t.Optional[int] = None,
+        ) -> tuple:
+            data_type = data_type.lower()
+            if (
+                data_type in self.VARIABLE_LENGTH_DATA_TYPES
+                and character_maximum_length is not None
+            ):
+                return (column_name, f"{data_type}({character_maximum_length})")
+            if data_type in ("decimal", "numeric"):
+                return (column_name, f"{data_type}({numeric_precision}, {numeric_scale})")
+
+            return (column_name, data_type)
+
+        columns = [build_var_length_col(*row) for row in columns_raw]
+
+        return {
+            column_name: exp.DataType.build(data_type, dialect=self.dialect)
+            for column_name, data_type in columns
+        }
 
     @property
     def cursor(self) -> t.Any:
@@ -79,7 +134,23 @@ class RedshiftEngineAdapter(
     ) -> pd.DataFrame:
         """Fetches a Pandas DataFrame from the cursor"""
         self.execute(query, quote_identifiers=quote_identifiers)
-        return self.cursor.fetch_dataframe()
+
+        # We manually build the `DataFrame` here because the driver's `fetch_dataframe`
+        # method does not respect the active case-sensitivity configuration.
+        #
+        # Context: https://github.com/aws/amazon-redshift-python-driver/issues/238
+        fetcheddata = self.cursor.fetchall()
+
+        try:
+            columns = [column[0] for column in self.cursor.description]
+        except Exception:
+            columns = None
+            logging.warning(
+                "No row description was found, pandas dataframe will be missing column labels."
+            )
+
+        result = [tuple(row) for row in fetcheddata]
+        return pd.DataFrame(result, columns=columns)
 
     def _create_table_from_source_queries(
         self,
@@ -138,6 +209,12 @@ class RedshiftEngineAdapter(
         underlying table without dropping the view first. This is a problem for us since we want to be able to
         swap tables out from under views. Therefore, we create the view as non-binding.
         """
+
+        if create_kwargs.pop("no_schema_binding", None) is False:
+            logger.warning(
+                "The 'no_schema_binding' attribute is deprecated. Views in Redshift are created as non-binding."
+            )
+
         return super().create_view(
             view_name,
             query_or_df,
@@ -147,7 +224,7 @@ class RedshiftEngineAdapter(
             materialized_properties,
             table_description=table_description,
             column_descriptions=column_descriptions,
-            no_schema_binding=create_kwargs.pop("no_schema_binding", True),
+            no_schema_binding=True,
             view_properties=view_properties,
             **create_kwargs,
         )
@@ -251,3 +328,57 @@ class RedshiftEngineAdapter(
             )
             for row in df.itertuples()
         ]
+
+    def _merge(
+        self,
+        target_table: TableName,
+        query: Query,
+        on: exp.Expression,
+        whens: exp.Whens,
+    ) -> None:
+        # Redshift does not support table aliases in the target table of a MERGE statement.
+        # So we must use the actual table name instead of an alias, as we do with the source table.
+        def resolve_target_table(expression: exp.Expression) -> exp.Expression:
+            if (
+                isinstance(expression, exp.Column)
+                and expression.table.upper() == MERGE_TARGET_ALIAS
+            ):
+                expression.set("table", exp.to_table(target_table))
+            return expression
+
+        # Ensure that there is exactly one "WHEN MATCHED" and one "WHEN NOT MATCHED" clause.
+        # Since Redshift does not support multiple "WHEN MATCHED" clauses.
+        if (
+            len(whens.expressions) != 2
+            or whens.expressions[0].args["matched"] == whens.expressions[1].args["matched"]
+        ):
+            raise SQLMeshError(
+                "Redshift only supports a single WHEN MATCHED and WHEN NOT MATCHED clause"
+            )
+
+        using = exp.alias_(
+            exp.Subquery(this=query), alias=MERGE_SOURCE_ALIAS, copy=False, table=True
+        )
+        self.execute(
+            exp.Merge(
+                this=target_table,
+                using=using,
+                on=on.transform(resolve_target_table),
+                whens=whens.transform(resolve_target_table),
+            )
+        )
+
+    def _normalize_decimal_value(self, expr: exp.Expression, precision: int) -> exp.Expression:
+        # Redshift is finicky. It truncates when the data is already in a table, but rounds when the data is generated as part of a SELECT.
+        #
+        # The following works:
+        #  > select cast(cast(3.14159 as decimal(6, 5)) as decimal(6, 3)); --produces '3.142', the value we want / what every other database produces
+        #
+        # However, if you write that to a table, and then cast it to a less precise decimal, you get _truncation_.
+        #  > create table foo (val decimal(6, 5)); insert into foo(val) values (3.14159);
+        #  > select cast(val as decimal(6, 3)) from foo; --produces '3.141'
+        #
+        # So to make up for this, we force it to round by injecting a round() expression
+        rounded = exp.func("ROUND", expr, precision)
+
+        return super()._normalize_decimal_value(rounded, precision)

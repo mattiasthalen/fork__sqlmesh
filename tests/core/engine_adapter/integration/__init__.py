@@ -4,6 +4,7 @@ import os
 import pathlib
 import sys
 import typing as t
+import time
 
 import pandas as pd
 import pytest
@@ -23,6 +24,7 @@ from sqlmesh.utils.pydantic import PydanticModel
 from tests.utils.pandas import compare_dataframes
 
 if t.TYPE_CHECKING:
+    from sqlmesh.core._typing import TableName
     from sqlmesh.core.engine_adapter._typing import Query
 
 TEST_SCHEMA = "test_schema"
@@ -83,6 +85,9 @@ class TestContext:
         self.test_id = random_id(short=True)
         self._context: t.Optional[Context] = None
         self.is_remote = is_remote
+        self._schemas: t.List[
+            str
+        ] = []  # keep track of any schemas returned from self.schema() / self.table() so we can drop them at the end
 
     @property
     def columns_to_types(self):
@@ -209,11 +214,16 @@ class TestContext:
     def output_data(self, data: pd.DataFrame) -> pd.DataFrame:
         return self._format_df(data)
 
-    def table(self, table_name: str, schema: str = TEST_SCHEMA) -> exp.Table:
+    def table(self, table_name: TableName, schema: str = TEST_SCHEMA) -> exp.Table:
         schema = self.add_test_suffix(schema)
+        self._schemas.append(schema)
+
+        table = exp.to_table(table_name, dialect=self.dialect)
+        table.set("db", exp.parse_identifier(schema, dialect=self.dialect))
+
         return exp.to_table(
             normalize_model_name(
-                ".".join([schema, table_name]),
+                table,
                 default_catalog=self.engine_adapter.default_catalog,
                 dialect=self.dialect,
             )
@@ -227,7 +237,7 @@ class TestContext:
         return {}
 
     def schema(self, schema_name: str = TEST_SCHEMA, catalog_name: t.Optional[str] = None) -> str:
-        return exp.table_name(
+        schema_name = exp.table_name(
             normalize_model_name(
                 self.add_test_suffix(
                     ".".join(
@@ -242,6 +252,8 @@ class TestContext:
                 dialect=self.dialect,
             )
         )
+        self._schemas.append(schema_name)
+        return schema_name
 
     def get_current_data(self, table: exp.Table) -> pd.DataFrame:
         df = self.engine_adapter.fetchdf(exp.select("*").from_(table), quote_identifiers=True)
@@ -379,7 +391,7 @@ class TestContext:
                     AND pgc.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
                 ;
             """
-        elif self.dialect in ["mysql", "snowflake"]:
+        elif self.dialect in ["mysql", "snowflake", "trino"]:
             # Snowflake treats all identifiers as uppercase unless they are lowercase and quoted.
             # They are lowercase and quoted in sushi but not in the inline tests.
             if self.dialect == "snowflake" and snowflake_capitalize_ids:
@@ -389,6 +401,7 @@ class TestContext:
             comment_field_name = {
                 "mysql": "column_comment",
                 "snowflake": "comment",
+                "trino": "comment",
             }
 
             query = f"""
@@ -400,7 +413,6 @@ class TestContext:
                 WHERE
                     table_schema = '{schema_name}'
                     AND table_name = '{table_name}'
-                ;
             """
         elif self.dialect == "bigquery":
             query = f"""
@@ -417,9 +429,6 @@ class TestContext:
         elif self.dialect in ["spark", "databricks", "clickhouse"]:
             query = f"DESCRIBE TABLE {schema_name}.{table_name}"
             comment_index = 2 if self.dialect in ["spark", "databricks"] else 4
-        elif self.dialect == "trino":
-            query = f"SHOW COLUMNS FROM {schema_name}.{table_name}"
-            comment_index = 3
         elif self.dialect == "duckdb":
             query = f"""
                 SELECT
@@ -447,7 +456,9 @@ class TestContext:
         return comments
 
     def create_context(
-        self, config_mutator: t.Optional[t.Callable[[str, Config], None]] = None
+        self,
+        config_mutator: t.Optional[t.Callable[[str, Config], None]] = None,
+        path: t.Optional[pathlib.Path] = None,
     ) -> Context:
         private_sqlmesh_dir = pathlib.Path(pathlib.Path().home(), ".sqlmesh")
         config = load_config_from_paths(
@@ -460,15 +471,26 @@ class TestContext:
         )
         if config_mutator:
             config_mutator(self.gateway, config)
+        config.gateways = {self.gateway: config.gateways[self.gateway]}
+
+        gateway_config = config.gateways[self.gateway]
+        if (
+            (sc := gateway_config.state_connection)
+            and (conn := gateway_config.connection)
+            and sc.type_ == "duckdb"
+        ):
+            # if duckdb is being used as the state connection, set concurrent_tasks=1 on the main connection
+            # to prevent duckdb from being accessed from multiple threads and getting deadlocked
+            conn.concurrent_tasks = 1
 
         if "athena" in self.gateway:
-            conn = config.gateways[self.gateway].connection
+            conn = gateway_config.connection
             assert isinstance(conn, AthenaConnectionConfig)
             assert isinstance(self.engine_adapter, AthenaEngineAdapter)
             # Ensure that s3_warehouse_location is propagated
             conn.s3_warehouse_location = self.engine_adapter.s3_warehouse_location
 
-        self._context = Context(paths=".", config=config, gateway=self.gateway)
+        self._context = Context(paths=path or ".", config=config, gateway=self.gateway)
         return self._context
 
     def create_catalog(self, catalog_name: str):
@@ -499,15 +521,15 @@ class TestContext:
             self.engine_adapter.execute(f'DROP DATABASE IF EXISTS "{catalog_name}"')
 
     def cleanup(self, ctx: t.Optional[Context] = None):
-        schemas = [self.schema(TEST_SCHEMA)]
+        self._schemas.append(self.schema(TEST_SCHEMA))
 
         ctx = ctx or self._context
         if ctx and ctx.models:
             for _, model in ctx.models.items():
-                schemas.append(model.schema_name)
-                schemas.append(model.physical_schema)
+                self._schemas.append(model.schema_name)
+                self._schemas.append(model.physical_schema)
 
-        for schema_name in set(schemas):
+        for schema_name in set(self._schemas):
             self.engine_adapter.drop_schema(
                 schema_name=schema_name, ignore_if_not_exists=True, cascade=True
             )
@@ -520,3 +542,15 @@ class TestContext:
         assert isinstance(model, SqlModel)
         self._context.upsert_model(model)
         return self._context, model
+
+
+def wait_until(fn: t.Callable[..., bool], attempts=3, wait=5) -> None:
+    current_attempt = 0
+    while current_attempt < attempts:
+        current_attempt += 1
+        result = fn()
+        if result:
+            return
+        time.sleep(wait)
+
+    raise Exception(f"Wait function did not return True after {attempts} attempts")

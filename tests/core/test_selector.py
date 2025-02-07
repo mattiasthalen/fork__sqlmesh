@@ -87,7 +87,7 @@ def test_select_models(mocker: MockerFixture, make_snapshot, default_catalog: t.
     local_models[modified_model_v2.fqn] = modified_model_v2.copy(
         update={"mapping_schema": added_model_schema}
     )
-    selector = Selector(state_reader_mock, local_models, {}, default_catalog=default_catalog)
+    selector = Selector(state_reader_mock, local_models, default_catalog=default_catalog)
 
     _assert_models_equal(
         selector.select_models(["db.added_model"], env_name),
@@ -175,7 +175,7 @@ def test_select_models(mocker: MockerFixture, make_snapshot, default_catalog: t.
         },
     )
     _assert_models_equal(
-        selector.select_models(["tag:+tag2"], env_name),
+        selector.select_models(["+tag:tag2"], env_name),
         {
             added_model.fqn: added_model,
             modified_model_v2.fqn: modified_model_v2.copy(
@@ -242,7 +242,7 @@ def test_select_models_expired_environment(mocker: MockerFixture, make_snapshot)
 
     local_models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
     local_models[modified_model_v2.fqn] = modified_model_v2
-    selector = Selector(state_reader_mock, local_models, {})
+    selector = Selector(state_reader_mock, local_models)
 
     _assert_models_equal(
         selector.select_models(["*.modified_model"], env_name, fallback_env_name="prod"),
@@ -298,7 +298,7 @@ def test_select_change_schema(mocker: MockerFixture, make_snapshot):
     local_child = child.copy(update={"mapping_schema": {'"db"': {'"parent"': {"b": "INT"}}}})
     local_models[local_child.fqn] = local_child
 
-    selector = Selector(state_reader_mock, local_models, {})
+    selector = Selector(state_reader_mock, local_models)
 
     selected = selector.select_models(["db.parent"], env_name)
     assert selected[local_child.fqn].data_hash != child.data_hash
@@ -332,7 +332,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
     local_models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
     local_models[model.fqn] = model
 
-    selector = Selector(state_reader_mock, local_models, {})
+    selector = Selector(state_reader_mock, local_models)
 
     assert selector.select_models([model.name], "missing_env").keys() == {model.fqn}
     assert not selector.select_models(["missing"], "missing_env")
@@ -375,7 +375,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
         # Upstream models are included
         (
             [("model1", "tag1", None), ("model2", "tag2", None), ("model3", "tag3", {"model2"})],
-            ["tag:+tag3"],
+            ["+tag:tag3"],
             {'"model2"', '"model3"'},
         ),
         # Upstream and downstream models are included
@@ -385,7 +385,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
                 ("model2", "tag2", {"model1"}),
                 ("model3", "tag3", {"model2"}),
             ],
-            ["tag:+tag2+"],
+            ["+tag:tag2+"],
             {'"model1"', '"model2"', '"model3"'},
         ),
         # Wildcard works with upstream and downstream models
@@ -399,7 +399,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
                 # Only excluded model since it doesn't match wildcard nor upstream/downstream
                 ("model6", "blah", None),
             ],
-            ["tag:+tag*+"],
+            ["+tag:tag*+"],
             {'"model1"', '"model2"', '"model3"', '"model4"', '"model5"'},
         ),
         # Multiple tags work
@@ -423,7 +423,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
                 ("model5", "tag5", {"model4"}),
                 ("model6", "tag6", {"model5"}),
             ],
-            ["tag:+tag3", "tag:tag5"],
+            ["+tag:tag3", "tag:tag5"],
             {'"model1"', '"model2"', '"model3"', '"model5"'},
         ),
         # Case-insensitive matching
@@ -452,7 +452,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
                 ("model1", "tag1", None),
                 ("model2", "tag2", None),
             ],
-            ["tag:+tag2"],
+            ["+tag:tag2"],
             {'"model2"'},
         ),
         # No matches returns empty set
@@ -461,7 +461,7 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
                 ("model1", "tag1", None),
                 ("model2", "tag2", None),
             ],
-            ["tag:+tag3*+", "tag:+tag3+"],
+            ["+tag:tag3*+", "+tag:tag3+"],
             set(),
         ),
         # Mix of models and tags
@@ -496,6 +496,54 @@ def test_select_models_missing_env(mocker: MockerFixture, make_snapshot):
             ["model1+ & tag:tag1"],
             {'"model1"', '"model2"'},
         ),
+        # negation
+        (
+            [("model1", "tag1", None), ("model2", "tag2", None), ("model3", "tag3", None)],
+            ["^tag:tag1"],
+            {'"model2"', '"model3"'},
+        ),
+        (
+            [("model1", "tag1", None), ("model2", "tag2", None), ("model3", "tag3", None)],
+            ["^model1"],
+            {'"model2"', '"model3"'},
+        ),
+        (
+            [("model1", "tag1", None), ("model2", "tag2", None), ("model3", "tag3", None)],
+            ["model* & ^(tag:tag1 | tag:tag2)"],
+            {'"model3"'},
+        ),
+        (
+            [
+                ("model1", "tag1", None),
+                ("model2", "tag2", {"model1"}),
+                ("model3", "tag3", {"model1"}),
+            ],
+            ["(model1*)+"],
+            {'"model1"', '"model2"', '"model3"'},
+        ),
+        (
+            [
+                ("model1", "tag1", None),
+                ("model2", "tag2", {"model1"}),
+                ("model3", "tag3", {"model2"}),
+            ],
+            ["+(+model2*+)+"],
+            {'"model1"', '"model2"', '"model3"'},
+        ),
+        (
+            [
+                ("model1", "tag1", None),
+                ("model2", "tag2", {"model1"}),
+                ("model3", "tag3", {"model1"}),
+            ],
+            ["(model* & ^*1)+"],
+            {'"model2"', '"model3"'},
+        ),
+        (
+            [("model2", "tag1", None), ("model2_1", "tag2", None), ("model2_2", "tag3", None)],
+            ["*2_*"],
+            {'"model2_1"', '"model2_2"'},
+        ),
     ],
 )
 def test_expand_model_selections(
@@ -508,7 +556,7 @@ def test_expand_model_selections(
         )
         models[model.fqn] = model
 
-    selector = Selector(mocker.Mock(), models, {})
+    selector = Selector(mocker.Mock(), models)
     assert selector.expand_model_selections(selections) == output
 
 
@@ -521,7 +569,7 @@ def test_model_selection_normalized(mocker: MockerFixture, make_snapshot):
         dialect="bigquery",
     )
     models[model.fqn] = model
-    selector = Selector(mocker.Mock(), models, {}, dialect="bigquery")
+    selector = Selector(mocker.Mock(), models, dialect="bigquery")
     assert selector.expand_model_selections(["db.test_Model"]) == {'"db"."test_Model"'}
 
 
@@ -569,7 +617,7 @@ def test_expand_git_selection(
     git_client_mock.list_uncommitted_changed_files.return_value = []
     git_client_mock.list_committed_changed_files.return_value = [model_a._path, model_c._path]
 
-    selector = Selector(mocker.Mock(), models, {})
+    selector = Selector(mocker.Mock(), models)
     selector._git_client = git_client_mock
 
     assert selector.expand_model_selections(expressions) == expected_fqns
@@ -603,7 +651,7 @@ def test_select_models_with_external_parent(mocker: MockerFixture):
     local_models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
     local_models[added_model.fqn] = added_model
 
-    selector = Selector(state_reader_mock, local_models, {}, default_catalog=default_catalog)
+    selector = Selector(state_reader_mock, local_models, default_catalog=default_catalog)
 
     expanded_selections = selector.expand_model_selections(["+*added_model*"])
     assert expanded_selections == {added_model.fqn}

@@ -5,7 +5,7 @@ import logging
 from sqlglot import exp
 from sqlmesh.core.dialect import to_schema
 from sqlmesh.utils.aws import validate_s3_uri, parse_s3_uri
-from sqlmesh.core.engine_adapter.mixins import PandasNativeFetchDFSupportMixin
+from sqlmesh.core.engine_adapter.mixins import PandasNativeFetchDFSupportMixin, RowDiffMixin
 from sqlmesh.core.engine_adapter.trino import TrinoEngineAdapter
 from sqlmesh.core.node import IntervalUnit
 import os
@@ -29,14 +29,10 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
+class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin, RowDiffMixin):
     DIALECT = "athena"
     SUPPORTS_TRANSACTIONS = False
     SUPPORTS_REPLACE_TABLE = False
-    # Athena has the concept of catalogs but the current catalog is set in the connection parameters with no way to query or change it after that
-    # It also cant create new catalogs, you have to configure them in AWS. Typically, catalogs that are not "awsdatacatalog"
-    # are pointers to the "awsdatacatalog" of other AWS accounts
-    CATALOG_SUPPORT = CatalogSupport.SINGLE_CATALOG_ONLY
     # Athena's support for table and column comments is too patchy to consider "supported"
     # Hive tables: Table + Column comments are supported
     # Iceberg tables: Column comments only
@@ -44,6 +40,7 @@ class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
     COMMENT_CREATION_TABLE = CommentCreationTable.UNSUPPORTED
     COMMENT_CREATION_VIEW = CommentCreationView.UNSUPPORTED
     SCHEMA_DIFFER = TrinoEngineAdapter.SCHEMA_DIFFER
+    MAX_TIMESTAMP_PRECISION = 3  # copied from Trino
 
     def __init__(
         self, *args: t.Any, s3_warehouse_location: t.Optional[str] = None, **kwargs: t.Any
@@ -72,6 +69,13 @@ class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
             return location
 
         raise SQLMeshError("s3_warehouse_location was expected to be populated; it isnt")
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        # Athena has the concept of catalogs but the current catalog is set in the connection parameters with no way to query or change it after that
+        # It also cant create new catalogs, you have to configure them in AWS. Typically, catalogs that are not "awsdatacatalog"
+        # are pointers to the "awsdatacatalog" of other AWS accounts
+        return CatalogSupport.SINGLE_CATALOG_ONLY
 
     def create_state_table(
         self,
@@ -227,7 +231,7 @@ class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -508,7 +512,7 @@ class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
             response = self._glue_client.batch_get_partition(
                 DatabaseName=table.db,
                 TableName=table.name,
-                PartitionsToGet=[{"Values": v} for v in partition_values],
+                PartitionsToGet=[{"Values": [str(v) for v in lst]} for lst in partition_values],
             )
             return sorted(
                 [(p["Values"], p["StorageDescriptor"]["Location"]) for p in response["Partitions"]]
@@ -526,13 +530,21 @@ class AthenaEngineAdapter(PandasNativeFetchDFSupportMixin):
         raise SQLMeshError(f"Table {table} has no location set in the metastore!")
 
     def _drop_partitions_from_metastore(
-        self, table: exp.Table, partition_values: t.List[t.List[t.Any]]
+        self, table: exp.Table, partition_values: t.List[t.List[str]]
     ) -> None:
-        self._glue_client.batch_delete_partition(
-            DatabaseName=table.db,
-            TableName=table.name,
-            PartitionsToDelete=[{"Values": v} for v in partition_values],
-        )
+        # todo: switch to itertools.batched when our minimum supported Python is 3.12
+        # 25 = maximum number of partitions that batch_delete_partition can process at once
+        # ref: https://docs.aws.amazon.com/glue/latest/webapi/API_BatchDeletePartition.html#API_BatchDeletePartition_RequestParameters
+        def _chunks() -> t.Iterable[t.List[t.List[str]]]:
+            for i in range(0, len(partition_values), 25):
+                yield partition_values[i : i + 25]
+
+        for batch in _chunks():
+            self._glue_client.batch_delete_partition(
+                DatabaseName=table.db,
+                TableName=table.name,
+                PartitionsToDelete=[{"Values": v} for v in batch],
+            )
 
     def delete_from(self, table_name: TableName, where: t.Union[str, exp.Expression]) -> None:
         table = exp.to_table(table_name)

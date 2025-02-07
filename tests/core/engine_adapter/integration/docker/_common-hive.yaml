@@ -8,6 +8,7 @@ services:
       POSTGRES_PASSWORD: hive
     volumes:
       - ./init-metastore-db.sql:/docker-entrypoint-initdb.d/initdb.sql
+    command: -c max_connections=500
 
   # S3-style object storage
   minio:
@@ -34,7 +35,8 @@ services:
       /usr/bin/mc mb --quiet myminio/trino/testing_iceberg;
       /usr/bin/mc mb --quiet myminio/trino/testing_delta;
       /usr/bin/mc mb --quiet myminio/spark/datalake;
-      /usr/bin/mc mb --quiet myminio/spark/testing
+      /usr/bin/mc mb --quiet myminio/spark/testing;
+      /usr/bin/mc mb --quiet myminio/nessie/warehouse;
       "
     depends_on:
       - minio

@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from tempfile import TemporaryDirectory
 from unittest.mock import PropertyMock, call, patch
 
-import freezegun
+import time_machine
 import pytest
 import pandas as pd
 from pathlib import Path
@@ -14,8 +14,9 @@ from pytest_mock.plugin import MockerFixture
 from sqlglot import exp, parse_one
 from sqlglot.errors import SchemaError
 
+from sqlmesh.core.config.gateway import GatewayConfig
 import sqlmesh.core.constants
-import sqlmesh.core.dialect as d
+from sqlmesh.core import dialect as d, constants as c
 from sqlmesh.core.config import (
     Config,
     DuckDBConnectionConfig,
@@ -25,11 +26,16 @@ from sqlmesh.core.config import (
     load_configs,
 )
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import create_console
 from sqlmesh.core.dialect import parse, schema_
+from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.model import load_sql_based_model, model
 from sqlmesh.core.model.kind import ModelKindName
 from sqlmesh.core.plan import BuiltInPlanEvaluator, PlanBuilder
+from sqlmesh.core.state_sync.cache import CachingStateSync
+from sqlmesh.core.state_sync.engine_adapter import EngineAdapterStateSync
+from sqlmesh.utils.connection_pool import SingletonConnectionPool, ThreadLocalConnectionPool
 from sqlmesh.utils.date import (
     make_inclusive_end,
     now,
@@ -78,7 +84,9 @@ def test_generate_table_name_in_dialect(mocker: MockerFixture):
         "sqlmesh.core.context.GenericContext._model_tables",
         PropertyMock(return_value={'"project-id"."dataset"."table"': '"project-id".dataset.table'}),
     )
-    assert context.table('"project-id"."dataset"."table"') == "`project-id`.`dataset`.`table`"
+    assert (
+        context.resolve_table('"project-id"."dataset"."table"') == "`project-id`.`dataset`.`table`"
+    )
 
 
 def test_config_not_found(copy_to_temp_path: t.Callable):
@@ -310,6 +318,97 @@ def test_evaluate_limit():
     assert context.evaluate("without_limit", "2020-01-01", "2020-01-02", "2020-01-02", 2).size == 2
 
 
+def test_gateway_specific_adapters(copy_to_temp_path, mocker):
+    path = copy_to_temp_path("examples/sushi")
+    ctx = Context(paths=path, config="isolated_systems_config", gateway="prod")
+    assert len(ctx._engine_adapters) == 1
+    assert ctx.engine_adapter == ctx._engine_adapters["prod"]
+
+    with pytest.raises(SQLMeshError):
+        assert ctx._get_engine_adapter("non_existing")
+
+    # This will create the requested engine adapter
+    assert ctx._get_engine_adapter("dev") == ctx._engine_adapters["dev"]
+
+    ctx = Context(paths=path, config="isolated_systems_config")
+    assert len(ctx._engine_adapters) == 1
+    assert ctx.engine_adapter == ctx._engine_adapters["dev"]
+
+    mocker.patch.object(
+        Context,
+        "_snapshot_gateways",
+        new_callable=mocker.PropertyMock(return_value={"test_snapshot": "test"}),
+    )
+
+    ctx = Context(paths=path, config="isolated_systems_config")
+
+    assert len(ctx.engine_adapters) == 3
+    assert ctx.engine_adapter == ctx._get_engine_adapter()
+    assert ctx._get_engine_adapter("test") == ctx._engine_adapters["test"]
+
+
+def test_multiple_gateways(tmp_path: Path):
+    db_path = str(tmp_path / "db.db")
+    gateways = {
+        "staging": GatewayConfig(connection=DuckDBConnectionConfig(database=db_path)),
+        "final": GatewayConfig(connection=DuckDBConnectionConfig(database=db_path)),
+    }
+
+    config = Config(gateways=gateways, default_gateway="final")
+    context = Context(config=config)
+
+    gateway_model = load_sql_based_model(
+        parse(
+            """
+    MODEL(name staging.stg_model, start '2024-01-01',kind FULL, gateway staging);
+    SELECT t.v as v FROM (VALUES (1), (2), (3), (4), (5)) AS t(v)"""
+        ),
+        default_catalog="db",
+    )
+
+    assert gateway_model.gateway == "staging"
+    context.upsert_model(gateway_model)
+    assert context.evaluate("staging.stg_model", "2020-01-01", "2020-01-02", "2020-01-02").size == 5
+
+    default_model = load_sql_based_model(
+        parse(
+            """
+    MODEL(name main.final_model, start '2024-01-01',kind FULL);
+    SELECT v FROM staging.stg_model"""
+        ),
+        default_catalog="db",
+    )
+
+    assert not default_model.gateway
+    context.upsert_model(default_model)
+
+    context.plan(
+        execution_time="2024-01-02",
+        auto_apply=True,
+        no_prompts=True,
+    )
+
+    sorted_snapshots = sorted(context.snapshots.values())
+
+    physical_schemas = [snapshot.physical_schema for snapshot in sorted_snapshots]
+    assert physical_schemas == ["sqlmesh__main", "sqlmesh__staging"]
+
+    view_schemas = [snapshot.qualified_view_name.schema_name for snapshot in sorted_snapshots]
+    assert view_schemas == ["main", "staging"]
+
+    assert (
+        str(context.fetchdf("select * from staging.stg_model"))
+        == "   v\n0  1\n1  2\n2  3\n3  4\n4  5"
+    )
+    assert str(context.fetchdf("select * from final_model")) == "   v\n0  1\n1  2\n2  3\n3  4\n4  5"
+
+    assert (
+        context.snapshots['"db"."main"."final_model"'].parents[0].name
+        == '"db"."staging"."stg_model"'
+    )
+    assert context.dag._sorted == ['"db"."staging"."stg_model"', '"db"."main"."final_model"']
+
+
 def test_plan_execution_time():
     context = Context(config=Config())
     context.upsert_model(
@@ -361,14 +460,27 @@ def test_override_builtin_audit_blocking_mode():
         )
     )
 
-    plan = context.plan(auto_apply=True, no_prompts=True)
-    new_snapshot = next(iter(plan.context_diff.new_snapshots.values()))
+    with patch.object(context.console, "log_warning") as mock_logger:
+        plan = context.plan(auto_apply=True, no_prompts=True)
+        new_snapshot = next(iter(plan.context_diff.new_snapshots.values()))
+
+        version = new_snapshot.fingerprint.to_version()
+        assert mock_logger.mock_calls == [
+            call(
+                "Audit 'not_null' for model 'db.x' failed.\n"
+                "Got 1 results, expected 0.\n"
+                f'SELECT * FROM (SELECT * FROM "sqlmesh__db"."db__x__{version}" AS "db__x__{version}") AS "_q_0" WHERE "c" IS NULL AND TRUE\n'
+                "Audit is non-blocking so proceeding with execution."
+            )
+        ]
 
     # Even though there are two builtin audits referenced in the above definition, we only
     # store the one that overrides `blocking` in the snapshot; the other one isn't needed
-    assert len(new_snapshot.audits) == 1
-    assert new_snapshot.audits[0].name == "not_null"
-    assert new_snapshot.audits[0].blocking is False
+    audits_with_args = new_snapshot.model.audits_with_args
+    assert len(audits_with_args) == 2
+    audit, args = audits_with_args[0]
+    assert audit.name == "not_null"
+    assert list(args) == ["columns", "blocking"]
 
     context = Context(config=Config())
     context.upsert_model(
@@ -394,6 +506,8 @@ def test_override_builtin_audit_blocking_mode():
 
 
 def test_python_model_empty_df_raises(sushi_context, capsys):
+    sushi_context.console = create_console()
+
     @model(
         "memory.sushi.test_model",
         columns={"col": "int"},
@@ -412,11 +526,8 @@ def test_python_model_empty_df_raises(sushi_context, capsys):
         sushi_context.plan(no_prompts=True, auto_apply=True)
 
     assert (
-        "Cannot construct source query from an empty \nDataFrame. This error "
-        "is commonly related to Python models that produce no data.\nFor such "
-        "models, consider yielding from an empty generator if the resulting set "
-        "\nis empty, i.e. use `yield from ()`"
-    ) in capsys.readouterr().out
+        "Cannot construct source query from an empty DataFrame. This error is commonly related to Python models that produce no data. For such models, consider yielding from an empty generator if the resulting set is empty, i.e. use"
+    ) in capsys.readouterr().out.replace("\n", "")
 
 
 def test_env_and_default_schema_normalization(mocker: MockerFixture):
@@ -479,6 +590,11 @@ def test_ignore_files(mocker: MockerFixture, tmp_path: pathlib.Path):
     )
     create_temp_file(
         tmp_path,
+        pathlib.Path(models_dir, "ignore", "inner_ignore", "inner_ignore_model.sql"),
+        "MODEL(name ignore.inner_ignore_model); SELECT 1 AS cola",
+    )
+    create_temp_file(
+        tmp_path,
         pathlib.Path(macros_dir, "macro_ignore.py"),
         """
 from sqlmesh.core.macros import macro
@@ -510,7 +626,7 @@ def test():
 """,
     )
     config = Config(
-        ignore_patterns=["models/ignore/*.sql", "macro_ignore.py", ".ipynb_checkpoints/*"]
+        ignore_patterns=["models/ignore/**/*.sql", "macro_ignore.py", ".ipynb_checkpoints/*"]
     )
     context = Context(paths=tmp_path, config=config)
 
@@ -576,6 +692,7 @@ model_defaults:
         assert snowflake_connection.account == "abc123"
         assert snowflake_connection.user == "ABC"
         assert snowflake_connection.password == "XYZ"
+        assert snowflake_connection.application == "Tobiko_SQLMesh"
 
 
 @pytest.mark.slow
@@ -688,7 +805,7 @@ def test_janitor(sushi_context, mocker: MockerFixture) -> None:
             previous_plan_id="test_plan_id",
         ),
     ]
-    sushi_context._engine_adapter = adapter_mock
+    sushi_context._engine_adapters = {sushi_context.config.default_gateway: adapter_mock}
     sushi_context._state_sync = state_sync_mock
     sushi_context._run_janitor()
     # Assert that the schemas are dropped just twice for the schema based environment
@@ -729,18 +846,18 @@ def test_plan_default_end(sushi_context_pre_scheduling: Context):
     assert dev_plan.end is not None
     assert to_date(make_inclusive_end(dev_plan.end)) == plan_end
 
-    forward_only_dev_plan = sushi_context_pre_scheduling.plan(
-        "test_env_forward_only", no_prompts=True, include_unmodified=True, forward_only=True
-    )
+    forward_only_dev_plan = sushi_context_pre_scheduling.plan_builder(
+        "test_env_forward_only", include_unmodified=True, forward_only=True
+    ).build()
     assert forward_only_dev_plan.end is not None
     assert to_date(make_inclusive_end(forward_only_dev_plan.end)) == plan_end
-    assert forward_only_dev_plan.start == plan_end
+    assert to_timestamp(forward_only_dev_plan.start) == to_timestamp(plan_end)
 
 
 @pytest.mark.slow
 def test_plan_start_ahead_of_end(copy_to_temp_path):
     path = copy_to_temp_path("examples/sushi")
-    with freezegun.freeze_time("2024-01-02 00:00:00"):
+    with time_machine.travel("2024-01-02 00:00:00 UTC"):
         context = Context(paths=path, gateway="duckdb_persistent")
         context.plan("prod", no_prompts=True, auto_apply=True)
         assert all(
@@ -748,7 +865,7 @@ def test_plan_start_ahead_of_end(copy_to_temp_path):
             for i in context.state_sync.max_interval_end_per_model("prod").values()
         )
         context.close()
-    with freezegun.freeze_time("2024-01-03 00:00:00"):
+    with time_machine.travel("2024-01-03 00:00:00 UTC"):
         context = Context(paths=path, gateway="duckdb_persistent")
         expression = d.parse(
             """
@@ -889,9 +1006,19 @@ def test_load_external_models(copy_to_temp_path):
     assert "prod_raw.model1" not in external_model_names
 
     # get physical table names of external models using table
-    assert context.table("raw.model1") == '"memory"."raw"."model1"'
-    assert context.table("raw.demographics") == '"memory"."raw"."demographics"'
-    assert context.table("raw.model2") == '"memory"."raw"."model2"'
+    assert context.resolve_table("raw.model1") == '"memory"."raw"."model1"'
+    assert context.resolve_table("raw.demographics") == '"memory"."raw"."demographics"'
+    assert context.resolve_table("raw.model2") == '"memory"."raw"."model2"'
+
+    with patch.object(context.console, "log_warning") as mock_logger:
+        context.table("raw.model1") == '"memory"."raw"."model1"'
+
+        assert mock_logger.mock_calls == [
+            call(
+                "The SQLMesh context's `table` method is deprecated and will be removed "
+                "in a future release. Please use the `resolve_table` method instead."
+            )
+        ]
 
 
 def test_load_gateway_specific_external_models(copy_to_temp_path):
@@ -943,7 +1070,7 @@ def test_get_model_mixed_dialects(copy_to_temp_path):
     model = load_sql_based_model(expression, default_catalog=context.default_catalog)
     context.upsert_model(model)
 
-    assert context.get_model("sushi.snowflake_dialect") == model
+    assert context.get_model("sushi.snowflake_dialect").dict() == model.dict()
 
 
 def test_override_dialect_normalization_strategy():
@@ -986,3 +1113,176 @@ def post_statement(evaluator):
 
     context = Context(paths=tmp_path, config=Config())
     context.plan(auto_apply=True, no_prompts=True)
+
+
+def test_wildcard(copy_to_temp_path: t.Callable):
+    parent_path = copy_to_temp_path("examples/multi")[0]
+
+    context = Context(paths=f"{parent_path}/*")
+    assert len(context.models) == 5
+
+
+def test_duckdb_state_connection_automatic_multithreaded_mode(tmp_path):
+    single_threaded_config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        default_gateway="duckdb",
+        gateways={
+            "duckdb": GatewayConfig(
+                connection=DuckDBConnectionConfig(concurrent_tasks=1),
+                state_connection=DuckDBConnectionConfig(concurrent_tasks=1),
+            )
+        },
+    )
+
+    # main connection 4 concurrent tasks, state connection 1 concurrent task,
+    # context should adjust concurrent tasks on state connection to match main connection
+    multi_threaded_config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        default_gateway="duckdb",
+        gateways={
+            "duckdb": GatewayConfig(
+                connection=DuckDBConnectionConfig(concurrent_tasks=4),
+                state_connection=DuckDBConnectionConfig(concurrent_tasks=1),
+            )
+        },
+    )
+
+    context = Context(paths=[tmp_path], config=single_threaded_config)
+    assert isinstance(context.state_sync, CachingStateSync)
+    state_sync = context.state_sync.state_sync
+    assert isinstance(state_sync, EngineAdapterStateSync)
+    assert isinstance(state_sync.engine_adapter, DuckDBEngineAdapter)
+    assert isinstance(state_sync.engine_adapter._connection_pool, SingletonConnectionPool)
+
+    context = Context(paths=[tmp_path], config=multi_threaded_config)
+    assert isinstance(context.state_sync, CachingStateSync)
+    state_sync = context.state_sync.state_sync
+    assert isinstance(state_sync, EngineAdapterStateSync)
+    assert isinstance(state_sync.engine_adapter, DuckDBEngineAdapter)
+    assert isinstance(state_sync.engine_adapter._connection_pool, ThreadLocalConnectionPool)
+
+
+def test_requirements(copy_to_temp_path: t.Callable):
+    from sqlmesh.utils.metaprogramming import Executable
+
+    context_path = copy_to_temp_path("examples/sushi")[0]
+
+    with open(context_path / c.REQUIREMENTS, "w") as f:
+        # Add pandas and test_package and exclude ruamel.yaml
+        f.write("pandas==2.2.2\ntest_package==1.0.0\n^ruamel.yaml\n^ruamel.yaml.clib")
+
+    context = Context(paths=context_path)
+
+    model = context.get_model("sushi.items")
+    model.python_env["ruamel"] = Executable(payload="import ruamel", kind="import")
+    model.python_env["Image"] = Executable(
+        payload="from ipywidgets.widgets.widget_media import Image", kind="import"
+    )
+
+    environment = context.plan(
+        "dev", no_prompts=True, skip_tests=True, skip_backfill=True, auto_apply=True
+    ).environment
+    requirements = {"ipywidgets", "numpy", "pandas", "test_package"}
+    assert environment.requirements["pandas"] == "2.2.2"
+    assert set(environment.requirements) == requirements
+
+    context._requirements = {"numpy": "2.1.2", "pandas": "2.2.1"}
+    context._excluded_requirements = {"ipywidgets", "ruamel.yaml", "ruamel.yaml.clib"}
+    diff = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build().context_diff
+    assert set(diff.previous_requirements) == requirements
+    assert set(diff.requirements) == {"numpy", "pandas"}
+
+
+@pytest.mark.slow
+def test_rendered_diff():
+    ctx = Context(config=Config())
+
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @OR(FALSE, TRUE));
+
+                SELECT 4 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @AND(TRUE, FALSE));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW @this_model
+                ON_VIRTUAL_UPDATE_END;
+
+                """
+            )
+        )
+    )
+
+    ctx.plan("dev", auto_apply=True, no_prompts=True)
+
+    # Alter the model's query and pre/post/virtual statements to cause the diff
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @AND(TRUE, NULL));
+
+                SELECT 5 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @OR(TRUE, NULL));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW IF EXISTS @this_model
+                ON_VIRTUAL_UPDATE_END;
+                """
+            )
+        )
+    )
+
+    plan = ctx.plan("dev", auto_apply=True, no_prompts=True, diff_rendered=True)
+
+    assert '''@@ -4,13 +4,13 @@
+
+ CREATE TABLE IF NOT EXISTS "foo" AS
+ (
+   SELECT
+-    FALSE OR TRUE
++    TRUE
+ )
+ SELECT
+-  6 AS "_col_0"
++  7 AS "_col_0"
+ CREATE TABLE IF NOT EXISTS "foo2" AS
+ (
+   SELECT
+-    TRUE AND FALSE
++    TRUE
+ )
+-DROP VIEW "test"
++DROP VIEW IF EXISTS "test"''' in plan.context_diff.text_diff('"test"')
+
+
+def test_plan_enable_preview_default(sushi_context: Context, sushi_dbt_context: Context):
+    assert sushi_context._plan_preview_enabled
+    assert not sushi_dbt_context._plan_preview_enabled
+
+    sushi_dbt_context.engine_adapter.SUPPORTS_CLONING = True
+    assert sushi_dbt_context._plan_preview_enabled
+
+
+def test_catalog_name_needs_to_be_quoted():
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        default_connection=DuckDBConnectionConfig(catalogs={'"foo--bar"': ":memory:"}),
+    )
+    context = Context(config=config)
+    parsed_model = parse("MODEL(name db.x, kind FULL); SELECT 1 AS c")
+    context.upsert_model(load_sql_based_model(parsed_model, default_catalog='"foo--bar"'))
+    context.plan(auto_apply=True, no_prompts=True)
+    assert context.fetchdf('select * from "foo--bar".db.x').to_dict() == {"c": {0: 1}}

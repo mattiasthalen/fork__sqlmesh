@@ -164,6 +164,13 @@ class DataObject(PydanticModel):
     name: str
     type: DataObjectType
 
+    # for type=DataObjectType.Table, only if the DB supports it
+    clustering_key: t.Optional[str] = None
+
+    @property
+    def is_clustered(self) -> bool:
+        return bool(self.clustering_key)
+
 
 class CatalogSupport(Enum):
     UNSUPPORTED = 1
@@ -289,7 +296,7 @@ def set_catalog(override_mapping: t.Optional[t.Dict[str, CatalogSupport]] = None
             # Need to convert args to list in order to later do assignment to the object
             list_args = list(args)
             engine_adapter = list_args[0]
-            catalog_support = override or engine_adapter.CATALOG_SUPPORT
+            catalog_support = override or engine_adapter.catalog_support
             # If there is full catalog support then we have nothing to do
             if catalog_support.is_full_support:
                 return func(*list_args, **kwargs)
@@ -310,6 +317,7 @@ def set_catalog(override_mapping: t.Optional[t.Dict[str, CatalogSupport]] = None
             catalog_name = expression.catalog
             if not catalog_name:
                 return func(*list_args, **kwargs)
+
             # If we have a catalog and this engine doesn't support catalogs then we need to error
             if catalog_support.is_unsupported:
                 raise UnsupportedCatalogOperationError(

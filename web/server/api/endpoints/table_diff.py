@@ -20,6 +20,7 @@ def get_table_diff(
     on: t.Optional[str] = None,
     model_or_snapshot: t.Optional[str] = None,
     where: t.Optional[str] = None,
+    temp_schema: t.Optional[str] = None,
     limit: int = 20,
     context: Context = Depends(get_loaded_context),
 ) -> TableDiff:
@@ -34,7 +35,7 @@ def get_table_diff(
         show=False,
     )
     _schema_diff = diff.schema_diff()
-    _row_diff = diff.row_diff()
+    _row_diff = diff.row_diff(temp_schema=temp_schema)
     schema_diff = SchemaDiff(
         source=_schema_diff.source,
         target=_schema_diff.target,
@@ -53,11 +54,10 @@ def get_table_diff(
         target_count=_row_diff.target_count,
         count_pct_change=_row_diff.count_pct_change,
     )
+
+    s_index, t_index, _ = diff.key_columns
     return TableDiff(
         schema_diff=schema_diff,
         row_diff=row_diff,
-        on=[
-            (eq.left.name, eq.right.name) if eq.left.table == "s" else (eq.right.name, eq.left.name)  # type: ignore
-            for eq in diff.on.find_all(exp.EQ)
-        ],
+        on=[(s.name, t.name) for s, t in zip(s_index, t_index)],
     )

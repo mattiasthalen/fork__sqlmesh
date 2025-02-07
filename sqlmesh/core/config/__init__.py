@@ -4,6 +4,7 @@ from sqlmesh.core.config.categorizer import (
 )
 from sqlmesh.core.config.common import EnvironmentSuffixTarget as EnvironmentSuffixTarget
 from sqlmesh.core.config.connection import (
+    AthenaConnectionConfig as AthenaConnectionConfig,
     BaseDuckDBConnectionConfig as BaseDuckDBConnectionConfig,
     BigQueryConnectionConfig as BigQueryConnectionConfig,
     ConnectionConfig as ConnectionConfig,
@@ -37,4 +38,5 @@ from sqlmesh.core.config.scheduler import (
     BuiltInSchedulerConfig as BuiltInSchedulerConfig,
     CloudComposerSchedulerConfig as CloudComposerSchedulerConfig,
     MWAASchedulerConfig as MWAASchedulerConfig,
+    YCAirflowSchedulerConfig as YCAirflowSchedulerConfig,
 )

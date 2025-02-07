@@ -1,5 +1,4 @@
 # type: ignore
-import sys
 import typing as t
 
 import pandas as pd
@@ -17,6 +16,11 @@ from sqlmesh.core.node import IntervalUnit
 from sqlmesh.utils import AttributeDict
 
 pytestmark = [pytest.mark.bigquery, pytest.mark.engine]
+
+
+@pytest.fixture
+def adapter(make_mocked_engine_adapter: t.Callable) -> BigQueryEngineAdapter:
+    return make_mocked_engine_adapter(BigQueryEngineAdapter)
 
 
 def test_insert_overwrite_by_time_partition_query(
@@ -73,7 +77,7 @@ def test_insert_overwrite_by_partition_query(
     assert sql_calls == [
         "CREATE SCHEMA IF NOT EXISTS `test_schema`",
         f"CREATE TABLE IF NOT EXISTS `test_schema`.`__temp_test_table_{temp_table_id}` PARTITION BY DATETIME_TRUNC(`ds`, MONTH) AS SELECT `a`, `ds` FROM `tbl`",
-        f"DECLARE _sqlmesh_target_partitions_ ARRAY<DATETIME> DEFAULT (SELECT ARRAY_AGG(PARSE_DATETIME('%Y%m', partition_id)) FROM `test_project`.`test_schema`.INFORMATION_SCHEMA.PARTITIONS WHERE table_name = '__temp_test_table_{temp_table_id}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__');",
+        f"DECLARE _sqlmesh_target_partitions_ ARRAY<DATETIME> DEFAULT (SELECT ARRAY_AGG(PARSE_DATETIME('%Y%m', partition_id)) FROM `test_project`.`test_schema`.`INFORMATION_SCHEMA.PARTITIONS` AS PARTITIONS WHERE table_name = '__temp_test_table_{temp_table_id}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__');",
         f"MERGE INTO `test_schema`.`test_table` AS `__MERGE_TARGET__` USING (SELECT `a`, `ds` FROM (SELECT * FROM `test_schema`.`__temp_test_table_{temp_table_id}`) AS `_subquery` WHERE DATETIME_TRUNC(`ds`, MONTH) IN UNNEST(`_sqlmesh_target_partitions_`)) AS `__MERGE_SOURCE__` ON FALSE WHEN NOT MATCHED BY SOURCE AND DATETIME_TRUNC(`ds`, MONTH) IN UNNEST(`_sqlmesh_target_partitions_`) THEN DELETE WHEN NOT MATCHED THEN INSERT (`a`, `ds`) VALUES (`a`, `ds`)",
         f"DROP TABLE IF EXISTS `test_schema`.`__temp_test_table_{temp_table_id}`",
     ]
@@ -120,7 +124,7 @@ def test_insert_overwrite_by_partition_query_unknown_column_types(
     assert sql_calls == [
         "CREATE SCHEMA IF NOT EXISTS `test_schema`",
         f"CREATE TABLE IF NOT EXISTS `test_schema`.`__temp_test_table_{temp_table_id}` PARTITION BY DATETIME_TRUNC(`ds`, MONTH) AS SELECT `a`, `ds` FROM `tbl`",
-        f"DECLARE _sqlmesh_target_partitions_ ARRAY<DATETIME> DEFAULT (SELECT ARRAY_AGG(PARSE_DATETIME('%Y%m', partition_id)) FROM `test_project`.`test_schema`.INFORMATION_SCHEMA.PARTITIONS WHERE table_name = '__temp_test_table_{temp_table_id}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__');",
+        f"DECLARE _sqlmesh_target_partitions_ ARRAY<DATETIME> DEFAULT (SELECT ARRAY_AGG(PARSE_DATETIME('%Y%m', partition_id)) FROM `test_project`.`test_schema`.`INFORMATION_SCHEMA.PARTITIONS` AS PARTITIONS WHERE table_name = '__temp_test_table_{temp_table_id}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__');",
         f"MERGE INTO `test_schema`.`test_table` AS `__MERGE_TARGET__` USING (SELECT `a`, `ds` FROM (SELECT * FROM `test_schema`.`__temp_test_table_{temp_table_id}`) AS `_subquery` WHERE DATETIME_TRUNC(`ds`, MONTH) IN UNNEST(`_sqlmesh_target_partitions_`)) AS `__MERGE_SOURCE__` ON FALSE WHEN NOT MATCHED BY SOURCE AND DATETIME_TRUNC(`ds`, MONTH) IN UNNEST(`_sqlmesh_target_partitions_`) THEN DELETE WHEN NOT MATCHED THEN INSERT (`a`, `ds`) VALUES (`a`, `ds`)",
         f"DROP TABLE IF EXISTS `test_schema`.`__temp_test_table_{temp_table_id}`",
     ]
@@ -181,15 +185,13 @@ def test_insert_overwrite_by_time_partition_pandas(
     assert execute_mock.call_count == 2
     assert retry_resp.call_count == 1
     assert db_call_mock.call_count == 1
+
     create_temp_table = db_call_mock.call_args_list[0]
     load_temp_table = retry_resp.call_args_list[0]
     merge, drop_temp_table = execute_mock.call_args_list
     merge_sql = merge[0][0]
     drop_temp_table_sql = drop_temp_table[0][0]
-    if sys.version_info < (3, 8):
-        create_temp_table.kwargs = create_temp_table[1]
-        load_temp_table.kwargs = load_temp_table[1]
-        drop_temp_table.kwargs = drop_temp_table[1]
+
     assert create_temp_table.kwargs == {
         "exists_ok": False,
         "table": get_temp_bq_table.return_value,
@@ -322,7 +324,7 @@ def test_create_table_date_partition(
         {"a": exp.DataType.build("int"), "b": exp.DataType.build("int")},
         partitioned_by=partition_by_cols,
         partition_interval_unit=IntervalUnit.DAY,
-        clustered_by=["b"],
+        clustered_by=[exp.column("b")],
     )
 
     sql_calls = _to_sql_calls(execute_mock)
@@ -677,7 +679,7 @@ def test_select_partitions_expr():
             granularity="day",
             catalog="{{ target.database }}",
         )
-        == "SELECT MAX(PARSE_DATE('%Y%m%d', partition_id)) FROM `{{ target.database }}`.`{{ adapter.resolve_schema(this) }}`.INFORMATION_SCHEMA.PARTITIONS WHERE table_name = '{{ adapter.resolve_identifier(this) }}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__'"
+        == "SELECT MAX(PARSE_DATE('%Y%m%d', partition_id)) FROM `{{ target.database }}`.`{{ adapter.resolve_schema(this) }}`.`INFORMATION_SCHEMA.PARTITIONS` AS PARTITIONS WHERE table_name = '{{ adapter.resolve_identifier(this) }}' AND NOT partition_id IS NULL AND partition_id <> '__NULL__'"
     )
 
     assert (
@@ -686,7 +688,7 @@ def test_select_partitions_expr():
             "test_table",
             "int64",
         )
-        == "SELECT MAX(CAST(partition_id AS INT64)) FROM `test_schema`.INFORMATION_SCHEMA.PARTITIONS WHERE table_name = 'test_table' AND NOT partition_id IS NULL AND partition_id <> '__NULL__'"
+        == "SELECT MAX(CAST(partition_id AS INT64)) FROM `test_schema`.`INFORMATION_SCHEMA.PARTITIONS` AS PARTITIONS WHERE table_name = 'test_table' AND NOT partition_id IS NULL AND partition_id <> '__NULL__'"
     )
 
 
@@ -795,7 +797,7 @@ def test_materialized_view_properties(
         materialized=True,
         materialized_properties={
             "partitioned_by": [exp.column("ds")],
-            "clustered_by": ["a"],
+            "clustered_by": [exp.column("a")],
             "partition_interval_unit": IntervalUnit.DAY,
         },
     )
@@ -896,3 +898,41 @@ def test_nested_fields_update(make_mocked_engine_adapter: t.Callable, mocker: Mo
         bigquery.SchemaField("details", "STRING", "REPEATED"),
     ]
     assert adapter._build_nested_fields(current_schema, new_nested_fields) == expected
+
+
+def test_get_alter_expressions_includes_catalog(
+    adapter: BigQueryEngineAdapter, mocker: MockerFixture
+):
+    adapter._default_catalog = "test_project"
+
+    columns_mock = mocker.patch(
+        "sqlmesh.core.engine_adapter.bigquery.BigQueryEngineAdapter.columns"
+    )
+    columns_mock.return_value = {
+        "a": exp.DataType.build("int"),
+    }
+
+    get_data_objects_mock = mocker.patch(
+        "sqlmesh.core.engine_adapter.bigquery.BigQueryEngineAdapter.get_data_objects"
+    )
+    get_data_objects_mock.return_value = []
+
+    adapter.get_alter_expressions("catalog1.foo.bar", "catalog2.bar.bing")
+
+    assert get_data_objects_mock.call_count == 2
+
+    schema, tables = get_data_objects_mock.call_args_list[0][0]
+    assert isinstance(schema, exp.Table)
+    assert isinstance(tables, set)
+    assert schema.catalog == "catalog1"
+    assert schema.db == "foo"
+    assert schema.sql(dialect="bigquery") == "catalog1.foo"
+    assert tables == {"bar"}
+
+    schema, tables = get_data_objects_mock.call_args_list[1][0]
+    assert isinstance(schema, exp.Table)
+    assert isinstance(tables, set)
+    assert schema.catalog == "catalog2"
+    assert schema.db == "bar"
+    assert schema.sql(dialect="bigquery") == "catalog2.bar"
+    assert tables == {"bing"}

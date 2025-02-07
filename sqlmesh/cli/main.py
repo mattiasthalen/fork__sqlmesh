@@ -12,6 +12,7 @@ from sqlmesh.cli import error_handler
 from sqlmesh.cli import options as opt
 from sqlmesh.cli.example_project import ProjectTemplate, init_example_project
 from sqlmesh.core.analytics import cli_analytics
+from sqlmesh.core.console import configure_console, get_console
 from sqlmesh.core.config import load_configs
 from sqlmesh.core.context import Context
 from sqlmesh.utils.date import TimeLike
@@ -20,6 +21,7 @@ from sqlmesh.utils.errors import MissingDependencyError
 logger = logging.getLogger(__name__)
 
 SKIP_LOAD_COMMANDS = ("create_external_models", "migrate", "rollback", "run")
+SKIP_CONTEXT_COMMANDS = ("init", "ui")
 
 
 def _sqlmesh_version() -> str:
@@ -39,11 +41,13 @@ def _sqlmesh_version() -> str:
     "--gateway",
     type=str,
     help="The name of the gateway.",
+    envvar="SQLMESH_GATEWAY",
 )
 @click.option(
     "--ignore-warnings",
     is_flag=True,
     help="Ignore warnings.",
+    envvar="SQLMESH_IGNORE_WARNINGS",
 )
 @click.option(
     "--debug",
@@ -80,7 +84,7 @@ def cli(
 
     if len(paths) == 1:
         path = os.path.abspath(paths[0])
-        if ctx.invoked_subcommand in ("init", "ui"):
+        if ctx.invoked_subcommand in SKIP_CONTEXT_COMMANDS:
             ctx.obj = path
             return
         elif ctx.invoked_subcommand in SKIP_LOAD_COMMANDS:
@@ -88,9 +92,8 @@ def cli(
 
     configs = load_configs(config, Context.CONFIG_TYPE, paths)
     log_limit = list(configs.values())[0].log_limit
-    configure_logging(
-        debug, ignore_warnings, log_to_stdout, log_limit=log_limit, log_file_dir=log_file_dir
-    )
+    configure_logging(debug, log_to_stdout, log_limit=log_limit, log_file_dir=log_file_dir)
+    configure_console(ignore_warnings=ignore_warnings)
 
     try:
         context = Context(
@@ -118,20 +121,30 @@ def cli(
     "-t",
     "--template",
     type=str,
-    help="Project template. Supported values: airflow, dbt, default, empty.",
+    help="Project template. Supported values: airflow, dbt, dlt, default, empty.",
+)
+@click.option(
+    "--dlt-pipeline",
+    type=str,
+    help="DLT pipeline for which to generate a SQLMesh project. Use alongside template: dlt",
 )
 @click.pass_context
 @error_handler
 @cli_analytics
 def init(
-    ctx: click.Context, sql_dialect: t.Optional[str] = None, template: t.Optional[str] = None
+    ctx: click.Context,
+    sql_dialect: t.Optional[str] = None,
+    template: t.Optional[str] = None,
+    dlt_pipeline: t.Optional[str] = None,
 ) -> None:
     """Create a new SQLMesh repository."""
     try:
         project_template = ProjectTemplate(template.lower() if template else "default")
     except ValueError:
         raise click.ClickException(f"Invalid project template '{template}'")
-    init_example_project(ctx.obj, dialect=sql_dialect, template=project_template)
+    init_example_project(
+        ctx.obj, dialect=sql_dialect, template=project_template, pipeline=dlt_pipeline
+    )
 
 
 @cli.command("render")
@@ -211,6 +224,7 @@ def evaluate(
 
 
 @cli.command("format")
+@click.argument("paths", nargs=-1)
 @click.option(
     "-t",
     "--transpile",
@@ -270,12 +284,14 @@ def evaluate(
 @click.pass_context
 @error_handler
 @cli_analytics
-def format(ctx: click.Context, **kwargs: t.Any) -> None:
+def format(
+    ctx: click.Context, paths: t.Optional[t.Tuple[str, ...]] = None, **kwargs: t.Any
+) -> None:
     """Format all SQL models and audits."""
     if kwargs.pop("no_rewrite_casts", None):
         kwargs["rewrite_casts"] = False
 
-    if not ctx.obj.format(**{k: v for k, v in kwargs.items() if v is not None}):
+    if not ctx.obj.format(**{k: v for k, v in kwargs.items() if v is not None}, paths=paths):
         ctx.exit(1)
 
 
@@ -322,6 +338,11 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     "--dry-run",
     is_flag=True,
     help="Skip the backfill step and only create a virtual update for the plan.",
+)
+@click.option(
+    "--empty-backfill",
+    is_flag=True,
+    help="Produce empty backfill. Like --skip-backfill no models will be backfilled, unlike --skip-backfill missing intervals will be recorded as if they were backfilled.",
 )
 @click.option(
     "--forward-only",
@@ -375,7 +396,7 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     "--backfill-model",
     type=str,
     multiple=True,
-    help="Backfill only the models whose names match the expression. This is supported only when targeting a development environment.",
+    help="Backfill only the models whose names match the expression.",
 )
 @click.option(
     "--no-diff",
@@ -394,6 +415,11 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
     help="Enable preview for forward-only models when targeting a development environment.",
     default=None,
 )
+@click.option(
+    "--diff-rendered",
+    is_flag=True,
+    help="Output text differences for the rendered versions of the models and standalone audits",
+)
 @opt.verbose
 @click.pass_context
 @error_handler
@@ -407,7 +433,7 @@ def plan(
     select_models = kwargs.pop("select_model") or None
     allow_destructive_models = kwargs.pop("allow_destructive_model") or None
     backfill_models = kwargs.pop("backfill_model") or None
-    context.console.verbose = verbose
+    setattr(get_console(), "verbose", verbose)
     context.plan(
         environment,
         restate_models=restate_models,
@@ -428,15 +454,32 @@ def plan(
     is_flag=True,
     help="Run for all missing intervals, ignoring individual cron schedules.",
 )
+@click.option(
+    "--select-model",
+    type=str,
+    multiple=True,
+    help="Select specific models to run. Note: this always includes upstream dependencies.",
+)
+@click.option(
+    "--exit-on-env-update",
+    type=int,
+    help="If set, the command will exit with the specified code if the run is interrupted by an update to the target environment.",
+)
+@click.option(
+    "--no-auto-upstream",
+    is_flag=True,
+    help="Do not automatically include upstream models. Only applicable when --select-model is used. Note: this may result in missing / invalid data for the selected models.",
+)
 @click.pass_context
 @error_handler
 @cli_analytics
 def run(ctx: click.Context, environment: t.Optional[str] = None, **kwargs: t.Any) -> None:
     """Evaluate missing intervals for the target environment."""
     context = ctx.obj
-    success = context.run(environment, **kwargs)
-    if not success:
-        raise click.ClickException("Run DAG Failed. See output for details.")
+    select_models = kwargs.pop("select_model") or None
+    completion_status = context.run(environment, select_models=select_models, **kwargs)
+    if completion_status.is_failure:
+        raise click.ClickException("Run failed.")
 
 
 @cli.command("invalidate")
@@ -500,7 +543,7 @@ def dag(ctx: click.Context, file: str, select_model: t.List[str]) -> None:
     "queries",
     type=(str, str),
     multiple=True,
-    required=True,
+    default=[],
     help="Queries that will be used to generate data for the model's dependencies.",
 )
 @click.option(
@@ -639,16 +682,17 @@ def fetchdf(ctx: click.Context, sql: str) -> None:
     is_flag=True,
     help="Skip the connection test.",
 )
+@opt.verbose
 @click.pass_obj
 @error_handler
 @cli_analytics
-def info(obj: Context, skip_connection: bool) -> None:
+def info(obj: Context, skip_connection: bool, verbose: bool) -> None:
     """
     Print information about a SQLMesh project.
 
     Includes counts of project models and macros and connection tests for the data warehouse.
     """
-    obj.print_info(skip_connection=skip_connection)
+    obj.print_info(skip_connection=skip_connection, verbose=verbose)
 
 
 @cli.command("ui")
@@ -666,9 +710,9 @@ def info(obj: Context, skip_connection: bool) -> None:
 )
 @click.option(
     "--mode",
-    type=click.Choice(["ide", "default", "docs", "plan"], case_sensitive=False),
-    default="default",
-    help="Mode to start the UI in. Default: default",
+    type=click.Choice(["ide", "catalog", "docs", "plan"], case_sensitive=False),
+    default="ide",
+    help="Mode to start the UI in. Default: ide",
 )
 @click.pass_context
 @error_handler
@@ -777,6 +821,11 @@ def create_external_models(obj: Context, **kwargs: t.Any) -> None:
     is_flag=True,
     help="Disable the check for a primary key (grain) that is missing or is not unique.",
 )
+@click.option(
+    "--temp-schema",
+    type=str,
+    help="Schema used for temporary tables. It can be `CATALOG.SCHEMA` or `SCHEMA`. Default: `sqlmesh_temp`",
+)
 @click.pass_obj
 @error_handler
 @cli_analytics
@@ -881,3 +930,39 @@ def clean(obj: Context) -> None:
 def table_name(obj: Context, model_name: str, dev: bool) -> None:
     """Prints the name of the physical table for the given model."""
     print(obj.table_name(model_name, dev))
+
+
+@cli.command("dlt_refresh")
+@click.argument("pipeline", required=True)
+@click.option(
+    "-t",
+    "--table",
+    type=str,
+    multiple=True,
+    help="The specific dlt tables to refresh in the SQLMesh models.",
+)
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    default=False,
+    help="If set, existing models are overwritten with the new DLT tables.",
+)
+@click.pass_context
+@error_handler
+@cli_analytics
+def dlt_refresh(
+    ctx: click.Context,
+    pipeline: str,
+    force: bool,
+    table: t.List[str] = [],
+) -> None:
+    """Attaches to a DLT pipeline with the option to update specific or all missing tables in the SQLMesh project."""
+    from sqlmesh.integrations.dlt import generate_dlt_models
+
+    sqlmesh_models = generate_dlt_models(ctx.obj, pipeline, list(table or []), force)
+    if sqlmesh_models:
+        model_names = "\n".join([f"- {model_name}" for model_name in sqlmesh_models])
+        ctx.obj.console.log_success(f"Updated SQLMesh project with models:\n{model_names}")
+    else:
+        ctx.obj.console.log_success("All SQLMesh models are up to date.")

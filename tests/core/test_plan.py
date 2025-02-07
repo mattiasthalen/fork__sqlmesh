@@ -4,7 +4,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import parse_one
 
@@ -70,6 +70,7 @@ def test_forward_only_plan_sets_version(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot_b.name: (snapshot_b, snapshot_b)},
@@ -123,6 +124,7 @@ def test_forward_only_dev(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot.name: (updated_snapshot, snapshot)},
@@ -182,6 +184,7 @@ def test_forward_only_metadata_change_dev(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -224,6 +227,7 @@ def test_forward_only_plan_added_models(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_b.snapshot_id},
         removed_snapshots={},
         modified_snapshots={snapshot_a.name: (snapshot_a, snapshot_a)},
@@ -273,6 +277,7 @@ def test_forward_only_plan_categorizes_change_model_kind_as_breaking(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot_old)},
@@ -314,6 +319,7 @@ def test_paused_forward_only_parent(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot_b.name: (snapshot_b, snapshot_b_old)},
@@ -345,6 +351,7 @@ def test_forward_only_plan_allow_destructive_models(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot_a.name: (snapshot_a, snapshot_a_old)},
@@ -408,6 +415,7 @@ def test_forward_only_plan_allow_destructive_models(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -465,6 +473,7 @@ def test_forward_only_model_on_destructive_change(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -483,7 +492,7 @@ def test_forward_only_model_on_destructive_change(
 
     with pytest.raises(
         PlanError,
-        match="""Plan results in a destructive change to forward-only model '"a"'s schema.""",
+        match="""Plan results in a destructive change to forward-only model '"a"'s schema that drops columns 'one', 'two'.""",
     ):
         PlanBuilder(context_diff_1, schema_differ).build()
 
@@ -518,6 +527,7 @@ def test_forward_only_model_on_destructive_change(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -596,6 +606,7 @@ def test_forward_only_model_on_destructive_change(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -634,6 +645,7 @@ def test_forward_only_model_on_destructive_change_no_column_types(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -674,6 +686,7 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         modified_snapshots={},
         removed_snapshots={},
@@ -694,6 +707,7 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
         execution_time="2022-01-05 12:00",
         is_dev=True,
         skip_backfill=False,
+        empty_backfill=False,
         no_gaps=False,
         forward_only=False,
         allow_destructive_models=set(),
@@ -701,7 +715,6 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
         environment_naming_info=EnvironmentNamingInfo(),
         directly_modified={snapshot_a.snapshot_id},
         indirectly_modified={},
-        ignored=set(),
         deployability_index=DeployabilityIndex.all_deployable(),
         restatements={},
         end_bounded=False,
@@ -713,7 +726,7 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
 
 
 @pytest.mark.slow
-@freeze_time()
+@time_machine.travel(now(), tick=False)
 def test_restate_models(sushi_context_pre_scheduling: Context):
     plan = sushi_context_pre_scheduling.plan(
         restate_models=["sushi.waiter_revenue_by_day", "tag:expensive"], no_prompts=True
@@ -745,26 +758,40 @@ def test_restate_models(sushi_context_pre_scheduling: Context):
         ),
     }
     assert plan.requires_backfill
+    assert plan.models_to_backfill == {
+        '"memory"."sushi"."customer_revenue_by_day"',
+        '"memory"."sushi"."customer_revenue_lifetime"',
+        '"memory"."sushi"."items"',
+        '"memory"."sushi"."order_items"',
+        '"memory"."sushi"."orders"',
+        '"memory"."sushi"."top_waiters"',
+        '"memory"."sushi"."waiter_revenue_by_day"',
+    }
 
     plan = sushi_context_pre_scheduling.plan(restate_models=["unknown_model"], no_prompts=True)
     assert not plan.has_changes
     assert not plan.restatements
+    assert plan.models_to_backfill is None
 
     plan = sushi_context_pre_scheduling.plan(restate_models=["tag:unknown_tag"], no_prompts=True)
     assert not plan.has_changes
     assert not plan.restatements
+    assert plan.models_to_backfill is None
 
 
 @pytest.mark.slow
-@freeze_time()
-def test_restate_models_with_existing_missing_intervals(sushi_context: Context):
+@time_machine.travel(now(minute_floor=False), tick=False)
+def test_restate_models_with_existing_missing_intervals(init_and_plan_context: t.Callable):
+    sushi_context, plan = init_and_plan_context("examples/sushi")
+    sushi_context.apply(plan)
+
     yesterday_ts = to_timestamp(yesterday_ds())
 
     assert not sushi_context.plan(no_prompts=True).requires_backfill
     waiter_revenue_by_day = sushi_context.snapshots['"memory"."sushi"."waiter_revenue_by_day"']
-    waiter_revenue_by_day.intervals = [
-        (waiter_revenue_by_day.intervals[0][0], yesterday_ts),
-    ]
+    sushi_context.state_sync.remove_intervals(
+        [(waiter_revenue_by_day, (yesterday_ts, waiter_revenue_by_day.intervals[0][1]))]
+    )
     assert sushi_context.plan(no_prompts=True).requires_backfill
 
     plan = sushi_context.plan(restate_models=["sushi.waiter_revenue_by_day"], no_prompts=True)
@@ -808,6 +835,13 @@ def test_restate_models_with_existing_missing_intervals(sushi_context: Context):
         ),
     ]
     assert plan.requires_backfill
+    assert plan.models_to_backfill == {
+        top_waiters_snapshot_id.name,
+        waiter_revenue_by_day_snapshot_id.name,
+        '"memory"."sushi"."items"',
+        '"memory"."sushi"."order_items"',
+        '"memory"."sushi"."orders"',
+    }
 
 
 def test_restate_symbolic_model(make_snapshot, mocker: MockerFixture):
@@ -825,6 +859,7 @@ def test_restate_symbolic_model(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -858,6 +893,7 @@ def test_restate_seed_model(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -881,6 +917,7 @@ def test_restate_missing_model(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -909,6 +946,7 @@ def test_new_snapshots_with_restatements(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -941,6 +979,7 @@ def test_end_validation(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_a.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -1005,6 +1044,7 @@ def test_forward_only_revert_not_allowed(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot.name: (snapshot, forward_only_snapshot)},
@@ -1062,6 +1102,7 @@ def test_forward_only_plan_seed_models(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot_a_updated.name: (snapshot_a_updated, snapshot_a)},
@@ -1092,6 +1133,7 @@ def test_start_inference(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_b.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -1132,6 +1174,7 @@ def test_auto_categorization(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -1171,6 +1214,7 @@ def test_auto_categorization_missing_schema_downstream(make_snapshot, mocker: Mo
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -1206,6 +1250,7 @@ def test_broken_references(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={snapshot_a.snapshot_id: snapshot_a.table_info},
         modified_snapshots={snapshot_b.name: (snapshot_b, snapshot_b)},
@@ -1240,6 +1285,7 @@ def test_broken_references_external_model(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={snapshot_a.snapshot_id: snapshot_a.table_info},
         modified_snapshots={snapshot_b.name: (snapshot_b, snapshot_b)},
@@ -1280,6 +1326,7 @@ def test_effective_from(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -1362,6 +1409,7 @@ def test_effective_from_non_evaluatble_model(make_snapshot, mocker: MockerFixtur
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -1397,6 +1445,7 @@ def test_new_environment_no_changes(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -1408,7 +1457,9 @@ def test_new_environment_no_changes(make_snapshot, mocker: MockerFixture):
     )
 
     schema_differ = DuckDBEngineAdapter.SCHEMA_DIFFER
-    with pytest.raises(PlanError, match="No changes were detected.*"):
+    with pytest.raises(
+        PlanError, match="Creating a new environment requires a change, but project files match.*"
+    ):
         PlanBuilder(context_diff, schema_differ, is_dev=True).build()
 
     assert (
@@ -1436,6 +1487,7 @@ def test_new_environment_with_changes(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot_a.name: (updated_snapshot_a, snapshot_a)},
@@ -1521,6 +1573,7 @@ def test_forward_only_models(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -1564,6 +1617,7 @@ def test_forward_only_models_model_kind_changed(make_snapshot, mocker: MockerFix
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={updated_snapshot.name: (updated_snapshot, snapshot)},
@@ -1625,6 +1679,7 @@ def test_indirectly_modified_forward_only_model(make_snapshot, mocker: MockerFix
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -1690,6 +1745,7 @@ def test_added_model_with_forward_only_parent(make_snapshot, mocker: MockerFixtu
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_b.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -1724,6 +1780,7 @@ def test_added_forward_only_model(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_a.snapshot_id, snapshot_b.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -1761,6 +1818,7 @@ def test_disable_restatement(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -1815,6 +1873,7 @@ def test_revert_to_previous_value(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={
@@ -2032,6 +2091,7 @@ def test_add_restatements(
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={},
@@ -2100,6 +2160,7 @@ def test_dev_plan_depends_past(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot.snapshot_id, snapshot_child.snapshot_id, unrelated_snapshot.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -2138,14 +2199,15 @@ def test_dev_plan_depends_past(make_snapshot, mocker: MockerFixture):
     dev_plan_start_ahead_of_model = PlanBuilder(
         context_diff, schema_differ, start="2023-01-02", end="2023-01-10", is_dev=True
     ).build()
-    assert len(dev_plan_start_ahead_of_model.new_snapshots) == 1
-    assert [x.name for x in dev_plan_start_ahead_of_model.new_snapshots] == ['"b"']
-    assert len(dev_plan_start_ahead_of_model.ignored) == 2
-    assert sorted(list(dev_plan_start_ahead_of_model.ignored)) == [
+    assert len(dev_plan_start_ahead_of_model.new_snapshots) == 3
+    assert not dev_plan_start_ahead_of_model.deployability_index.is_deployable(snapshot)
+    assert not dev_plan_start_ahead_of_model.deployability_index.is_deployable(snapshot_child)
+    assert dev_plan_start_ahead_of_model.deployability_index.is_deployable(unrelated_snapshot)
+    assert dev_plan_start_ahead_of_model.directly_modified == {
         snapshot.snapshot_id,
         snapshot_child.snapshot_id,
-    ]
-    assert dev_plan_start_ahead_of_model.directly_modified == {unrelated_snapshot.snapshot_id}
+        unrelated_snapshot.snapshot_id,
+    }
     assert dev_plan_start_ahead_of_model.indirectly_modified == {}
 
 
@@ -2201,6 +2263,7 @@ def test_dev_plan_depends_past_non_deployable(make_snapshot, mocker: MockerFixtu
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_child.snapshot_id, unrelated_snapshot.snapshot_id},
         removed_snapshots={},
         modified_snapshots={snapshot.name: (updated_snapshot, snapshot)},
@@ -2234,15 +2297,6 @@ def test_dev_plan_depends_past_non_deployable(make_snapshot, mocker: MockerFixtu
         '"a_child"',
         '"b"',
     ]
-
-    # There should be no ignored snapshots because all changes are non-deployable.
-    dev_plan_start_ahead_of_model = new_builder(start="2023-01-02", end="2023-01-10").build()
-    assert sorted([x.name for x in dev_plan_start_ahead_of_model.new_snapshots]) == [
-        '"a"',
-        '"a_child"',
-        '"b"',
-    ]
-    assert not dev_plan_start_ahead_of_model.ignored
 
 
 def test_restatement_intervals_after_updating_start(sushi_context: Context):
@@ -2280,6 +2334,7 @@ def test_models_selected_for_backfill(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_b.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -2294,11 +2349,6 @@ def test_models_selected_for_backfill(make_snapshot, mocker: MockerFixture):
     )
 
     schema_differ = DuckDBEngineAdapter.SCHEMA_DIFFER
-    with pytest.raises(
-        PlanError,
-        match="Selecting models to backfill is only supported for development environments",
-    ):
-        PlanBuilder(context_diff, schema_differ, backfill_models={'"a"'}).build()
 
     plan = PlanBuilder(context_diff, schema_differ).build()
     assert plan.is_selected_for_backfill('"a"')
@@ -2339,6 +2389,7 @@ def test_categorized_uncategorized(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={new_snapshot.name: (new_snapshot, snapshot)},
@@ -2386,6 +2437,7 @@ def test_environment_previous_finalized_snapshots(make_snapshot, mocker: MockerF
         is_unfinalized_environment=True,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot_b.snapshot_id},
         removed_snapshots={snapshot_c.snapshot_id: snapshot_c.table_info},
         modified_snapshots={snapshot_a.name: (updated_snapshot_a, snapshot_a)},
@@ -2446,6 +2498,7 @@ def test_metadata_change(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={snapshot.name: (updated_snapshot, snapshot)},
@@ -2483,6 +2536,7 @@ def test_plan_start_when_preview_enabled(make_snapshot, mocker: MockerFixture):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added={snapshot.snapshot_id},
         removed_snapshots={},
         modified_snapshots={},
@@ -2497,7 +2551,6 @@ def test_plan_start_when_preview_enabled(make_snapshot, mocker: MockerFixture):
 
     default_start_for_preview = "2024-06-09"
 
-    # When a model is added SQLMesh should not consider the backfill to be a preview.
     plan_builder = PlanBuilder(
         context_diff,
         DuckDBEngineAdapter.SCHEMA_DIFFER,
@@ -2505,7 +2558,7 @@ def test_plan_start_when_preview_enabled(make_snapshot, mocker: MockerFixture):
         is_dev=True,
         enable_preview=True,
     )
-    assert plan_builder.build().start == to_timestamp(model_start)
+    assert plan_builder.build().start == default_start_for_preview
 
     # When a model is modified then the backfill should be a preview.
     snapshot = make_snapshot(model)
@@ -2534,6 +2587,7 @@ def test_interval_end_per_model(make_snapshot):
         is_unfinalized_environment=False,
         normalize_environment_name=True,
         create_from="prod",
+        create_from_env_exists=True,
         added=set(),
         removed_snapshots={},
         modified_snapshots={new_snapshot.name: (new_snapshot, snapshot)},
@@ -2562,3 +2616,71 @@ def test_interval_end_per_model(make_snapshot):
         is_dev=True,
     )
     assert plan_builder.build().interval_end_per_model is None
+
+
+def test_unaligned_start_model_with_forward_only_preview(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1, ds"),
+            kind=dict(
+                name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, forward_only=True, time_column="ds"
+            ),
+        )
+    )
+    snapshot_a.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    new_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 2, ds"),
+            kind=dict(
+                name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, forward_only=True, time_column="ds"
+            ),
+        )
+    )
+    new_snapshot_a.previous_versions = snapshot_a.all_versions
+    new_snapshot_a.unpaused_ts = 1
+
+    snapshot_b = make_snapshot(
+        SqlModel(
+            name="b",
+            query=parse_one("select 1 AS key"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_UNIQUE_KEY, unique_key="key"),
+            start="2024-01-01",
+            depends_on={"a"},
+        ),
+        nodes={new_snapshot_a.name: new_snapshot_a.model},
+    )
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added={snapshot_b.snapshot_id},
+        removed_snapshots={},
+        snapshots={new_snapshot_a.snapshot_id: new_snapshot_a, snapshot_b.snapshot_id: snapshot_b},
+        new_snapshots={
+            new_snapshot_a.snapshot_id: new_snapshot_a,
+            snapshot_b.snapshot_id: snapshot_b,
+        },
+        modified_snapshots={snapshot_a.name: (new_snapshot_a, snapshot_a)},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+    )
+
+    plan_builder = PlanBuilder(
+        context_diff,
+        DuckDBEngineAdapter.SCHEMA_DIFFER,
+        enable_preview=True,
+        is_dev=True,
+    )
+    plan = plan_builder.build()
+
+    assert set(plan.restatements) == {new_snapshot_a.snapshot_id, snapshot_b.snapshot_id}
+    assert not plan.deployability_index.is_deployable(new_snapshot_a)
+    assert not plan.deployability_index.is_deployable(snapshot_b)

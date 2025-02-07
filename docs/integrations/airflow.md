@@ -134,7 +134,7 @@ Multiple companies offer managed Airflow instances that integrate with their pro
 
 ### Google Cloud Composer
 
-SQLMesh fully supports Airflow hosted on [Google Cloud Composer](https://cloud.google.com/composer/docs/composer-2/composer-overview) - see the [configuration reference page](../reference/configuration.md#cloud-composer) for more information.
+SQLMesh fully supports Airflow hosted on [Google Cloud Composer](https://cloud.google.com/composer/docs/composer-3/composer-overview) - see the [configuration reference page](../reference/configuration.md#cloud-composer) for more information.
 
 ### Astronomer
 
@@ -155,3 +155,7 @@ default_scheduler:
   type: mwaa
   environment: <The MWAA Environment Name>
 ```
+
+### YC Airflow
+
+SQLMesh fully supports Airflow hosted on Yandex [managed Airflow instances](https://yandex.cloud/en/services/managed-airflow) - see the [configuration reference page](../reference/configuration.md#yc-airflow) for more information.

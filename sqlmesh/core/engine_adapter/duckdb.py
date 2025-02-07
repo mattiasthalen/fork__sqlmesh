@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
     LogicalMergeMixin,
+    RowDiffMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CatalogSupport,
@@ -26,10 +27,9 @@ if t.TYPE_CHECKING:
 
 
 @set_catalog(override_mapping={"_get_data_objects": CatalogSupport.REQUIRES_SET_CATALOG})
-class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin):
+class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin, RowDiffMixin):
     DIALECT = "duckdb"
     SUPPORTS_TRANSACTIONS = False
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     SCHEMA_DIFFER = SchemaDiffer(
         parameterized_type_defaults={
             exp.DataType.build("DECIMAL", dialect=DIALECT).this: [(18, 3), (0,)],
@@ -42,6 +42,10 @@ class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin)
         if major_minor(duckdb_version) < (0, 10)
         else (CommentCreationTable.COMMENT_COMMAND_ONLY, CommentCreationView.COMMENT_COMMAND_ONLY)
     )
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
 
     def set_current_catalog(self, catalog: str) -> None:
         """Sets the catalog name of the current connection."""
@@ -99,7 +103,7 @@ class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin)
                 )
                 .as_("type"),
             )
-            .from_(exp.to_table("information_schema.tables"))
+            .from_(exp.to_table("system.information_schema.tables"))
             .where(
                 exp.column("table_catalog").eq(catalog), exp.column("table_schema").eq(schema_name)
             )
@@ -116,3 +120,18 @@ class DuckDBEngineAdapter(LogicalMergeMixin, GetCurrentCatalogFromFunctionMixin)
             )
             for row in df.itertuples()
         ]
+
+    def _normalize_decimal_value(self, col: exp.Expression, precision: int) -> exp.Expression:
+        """
+        duckdb truncates instead of rounding when casting to decimal.
+
+        other databases: select cast(3.14159 as decimal(38,3)) -> 3.142
+        duckdb: select cast(3.14159 as decimal(38,3)) -> 3.141
+
+        however, we can get the behaviour of other databases by casting to double first:
+        select cast(cast(3.14159 as double) as decimal(38, 3)) -> 3.142
+        """
+        return exp.cast(
+            exp.cast(col, "DOUBLE"),
+            f"DECIMAL(38, {precision})",
+        )

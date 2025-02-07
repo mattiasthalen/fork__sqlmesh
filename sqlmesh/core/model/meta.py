@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
 import typing as t
 from functools import cached_property
+from typing_extensions import Self
 
 from pydantic import Field
 from sqlglot import Dialect, exp
@@ -10,12 +10,11 @@ from sqlglot.helper import ensure_collection, ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sqlmesh.core import dialect as d
-from sqlmesh.core.dialect import normalize_model_name, extract_audit
+from sqlmesh.core.dialect import normalize_model_name, extract_func_call
 from sqlmesh.core.model.common import (
     bool_validator,
     default_catalog_validator,
     depends_on_validator,
-    parse_properties,
     properties_validator,
 )
 from sqlmesh.core.model.kind import (
@@ -35,19 +34,16 @@ from sqlmesh.core.reference import Reference
 from sqlmesh.utils.date import TimeLike
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import (
+    ValidationInfo,
     field_validator,
-    field_validator_v1_args,
     list_of_fields_validator,
     model_validator,
-    model_validator_v1_args,
 )
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import CustomMaterializationProperties, SessionProperties
 
-AuditReference = t.Tuple[str, t.Dict[str, exp.Expression]]
-
-logger = logging.getLogger(__name__)
+FunctionCall = t.Tuple[str, t.Dict[str, exp.Expression]]
 
 
 class ModelMeta(_Node):
@@ -60,14 +56,14 @@ class ModelMeta(_Node):
     table_format: t.Optional[str] = None
     storage_format: t.Optional[str] = None
     partitioned_by_: t.List[exp.Expression] = Field(default=[], alias="partitioned_by")
-    clustered_by: t.List[str] = []
+    clustered_by: t.List[exp.Expression] = []
     default_catalog: t.Optional[str] = None
     depends_on_: t.Optional[t.Set[str]] = Field(default=None, alias="depends_on")
     columns_to_types_: t.Optional[t.Dict[str, exp.DataType]] = Field(default=None, alias="columns")
     column_descriptions_: t.Optional[t.Dict[str, str]] = Field(
         default=None, alias="column_descriptions"
     )
-    audits: t.List[AuditReference] = []
+    audits: t.List[FunctionCall] = []
     grains: t.List[exp.Expression] = []
     references: t.List[exp.Expression] = []
     physical_schema_override: t.Optional[str] = None
@@ -75,8 +71,12 @@ class ModelMeta(_Node):
     virtual_properties_: t.Optional[exp.Tuple] = Field(default=None, alias="virtual_properties")
     session_properties_: t.Optional[exp.Tuple] = Field(default=None, alias="session_properties")
     allow_partials: bool = False
-    signals: t.List[exp.Tuple] = []
+    signals: t.List[FunctionCall] = []
     enabled: bool = True
+    physical_version: t.Optional[str] = None
+    gateway: t.Optional[str] = None
+    optimize_query: t.Optional[bool] = None
+    validate_query: t.Optional[bool] = None
 
     _bool_validator = bool_validator
     _model_kind_validator = model_kind_validator
@@ -84,21 +84,23 @@ class ModelMeta(_Node):
     _default_catalog_validator = default_catalog_validator
     _depends_on_validator = depends_on_validator
 
-    @field_validator("audits", mode="before")
-    def _audits_validator(cls, v: t.Any) -> t.Any:
+    @field_validator("audits", "signals", mode="before")
+    def _func_call_validator(cls, v: t.Any, field: t.Any) -> t.Any:
+        is_signal = getattr(field, "name" if hasattr(field, "name") else "field_name") == "signals"
+
         if isinstance(v, (exp.Tuple, exp.Array)):
-            return [extract_audit(i) for i in v.expressions]
+            return [extract_func_call(i, allow_tuples=is_signal) for i in v.expressions]
         if isinstance(v, exp.Paren):
-            return [extract_audit(v.this)]
+            return [extract_func_call(v.this, allow_tuples=is_signal)]
         if isinstance(v, exp.Expression):
-            return [extract_audit(v)]
+            return [extract_func_call(v, allow_tuples=is_signal)]
         if isinstance(v, list):
             audits = []
 
             for entry in v:
                 if isinstance(entry, dict):
                     args = entry
-                    name = entry.pop("name")
+                    name = "" if is_signal else entry.pop("name")
                 elif isinstance(entry, (tuple, list)):
                     name, args = entry
                 else:
@@ -116,23 +118,17 @@ class ModelMeta(_Node):
 
             return audits
 
-        return v
+        return v or []
 
     @field_validator("tags", mode="before")
-    @field_validator_v1_args
-    def _value_or_tuple_validator(cls, v: t.Any, values: t.Dict[str, t.Any]) -> t.Any:
-        return ensure_list(cls._validate_value_or_tuple(v, values))
-
-    @field_validator("clustered_by", mode="before")
-    @field_validator_v1_args
-    def _normalized_value_or_tuple_validator(cls, v: t.Any, values: t.Dict[str, t.Any]) -> t.Any:
-        return ensure_list(cls._validate_value_or_tuple(v, values, normalize=True))
+    def _value_or_tuple_validator(cls, v: t.Any, info: ValidationInfo) -> t.Any:
+        return ensure_list(cls._validate_value_or_tuple(v, info.data))
 
     @classmethod
     def _validate_value_or_tuple(
-        cls, v: t.Dict[str, t.Any], values: t.Dict[str, t.Any], normalize: bool = False
+        cls, v: t.Dict[str, t.Any], data: t.Dict[str, t.Any], normalize: bool = False
     ) -> t.Any:
-        dialect = values.get("dialect")
+        dialect = data.get("dialect")
 
         def _normalize(value: t.Any) -> t.Any:
             return normalize_identifiers(value, dialect=dialect) if normalize else value
@@ -148,15 +144,14 @@ class ModelMeta(_Node):
             value = _normalize(v)
             return value.name if isinstance(value, exp.Expression) else value
         if isinstance(v, (list, tuple)):
-            return [cls._validate_value_or_tuple(elm, values, normalize=normalize) for elm in v]
+            return [cls._validate_value_or_tuple(elm, data, normalize=normalize) for elm in v]
 
         return v
 
     @field_validator("table_format", "storage_format", mode="before")
-    @field_validator_v1_args
-    def _format_validator(cls, v: t.Any, values: t.Dict[str, t.Any]) -> t.Optional[str]:
+    def _format_validator(cls, v: t.Any, info: ValidationInfo) -> t.Optional[str]:
         if isinstance(v, exp.Expression) and not (isinstance(v, (exp.Literal, exp.Identifier))):
-            return v.sql(values.get("dialect"))
+            return v.sql(info.data.get("dialect"))
         return str_or_exp_to_str(v)
 
     @field_validator("dialect", mode="before")
@@ -166,15 +161,27 @@ class ModelMeta(_Node):
         dialect = str_or_exp_to_str(v)
         return dialect and dialect.lower()
 
-    @field_validator("partitioned_by_", mode="before")
-    @field_validator_v1_args
-    def _partition_by_validator(
-        cls, v: t.Any, values: t.Dict[str, t.Any]
-    ) -> t.List[exp.Expression]:
-        partitions = list_of_fields_validator(v, values)
+    @field_validator("physical_version", mode="before")
+    def _physical_version_validator(cls, v: t.Any) -> t.Optional[str]:
+        if v is None:
+            return v
+        return str_or_exp_to_str(v)
 
-        for partition in partitions:
-            num_cols = len(list(partition.find_all(exp.Column)))
+    @field_validator("gateway", mode="before")
+    def _gateway_validator(cls, v: t.Any) -> t.Optional[str]:
+        if v is None:
+            return None
+        gateway = str_or_exp_to_str(v)
+        return gateway and gateway.lower()
+
+    @field_validator("partitioned_by_", "clustered_by", mode="before")
+    def _partition_and_cluster_validator(
+        cls, v: t.Any, info: ValidationInfo
+    ) -> t.List[exp.Expression]:
+        expressions = list_of_fields_validator(v, info.data)
+
+        for expression in expressions:
+            num_cols = len(list(expression.find_all(exp.Column)))
 
             error_msg: t.Optional[str] = None
             if num_cols == 0:
@@ -183,19 +190,18 @@ class ModelMeta(_Node):
                 error_msg = "contains multiple columns"
 
             if error_msg:
-                raise ConfigError(f"partitioned_by field '{partition}' {error_msg}")
+                raise ConfigError(f"Field '{expression}' {error_msg}")
 
-        return partitions
+        return expressions
 
     @field_validator(
         "columns_to_types_", "derived_columns_to_types", mode="before", check_fields=False
     )
-    @field_validator_v1_args
     def _columns_validator(
-        cls, v: t.Any, values: t.Dict[str, t.Any]
+        cls, v: t.Any, info: ValidationInfo
     ) -> t.Optional[t.Dict[str, exp.DataType]]:
         columns_to_types = {}
-        dialect = values.get("dialect")
+        dialect = info.data.get("dialect")
 
         if isinstance(v, exp.Schema):
             for column in v.expressions:
@@ -217,11 +223,10 @@ class ModelMeta(_Node):
         return v
 
     @field_validator("column_descriptions_", mode="before")
-    @field_validator_v1_args
     def _column_descriptions_validator(
-        cls, vs: t.Any, values: t.Dict[str, t.Any]
+        cls, vs: t.Any, info: ValidationInfo
     ) -> t.Optional[t.Dict[str, str]]:
-        dialect = values.get("dialect")
+        dialect = info.data.get("dialect")
 
         if vs is None:
             return None
@@ -241,20 +246,19 @@ class ModelMeta(_Node):
             for k, v in raw_col_descriptions.items()
         }
 
-        columns_to_types = values.get("columns_to_types_")
+        columns_to_types = info.data.get("columns_to_types_")
         if columns_to_types:
             for column_name in col_descriptions:
                 if column_name not in columns_to_types:
                     raise ConfigError(
-                        f"In model '{values['name']}', a description is provided for column '{column_name}' but it is not a column in the model."
+                        f"In model '{info.data['name']}', a description is provided for column '{column_name}' but it is not a column in the model."
                     )
 
         return col_descriptions
 
     @field_validator("grains", "references", mode="before")
-    @field_validator_v1_args
-    def _refs_validator(cls, vs: t.Any, values: t.Dict[str, t.Any]) -> t.List[exp.Expression]:
-        dialect = values.get("dialect")
+    def _refs_validator(cls, vs: t.Any, info: ValidationInfo) -> t.List[exp.Expression]:
+        dialect = info.data.get("dialect")
 
         if isinstance(vs, exp.Paren):
             vs = vs.unnest()
@@ -276,88 +280,69 @@ class ModelMeta(_Node):
 
         return refs
 
-    @field_validator("signals", mode="before")
-    @field_validator_v1_args
-    def _signals_validator(cls, v: t.Any, values: t.Dict[str, t.Any]) -> t.Any:
-        if v is None:
-            return []
-
-        if isinstance(v, str):
-            dialect = values.get("dialect")
-            v = d.parse_one(v, dialect=dialect)
-
-        if isinstance(v, (exp.Array, exp.Paren, exp.Tuple)):
-            tuples: t.List[exp.Expression] = (
-                [v.unnest()] if isinstance(v, exp.Paren) else v.expressions
-            )
-            signals = [parse_properties(cls, t, values) for t in tuples]
-        elif isinstance(v, list):
-            signals = [parse_properties(cls, t, values) for t in v]
-        else:
-            raise ConfigError(f"Unexpected signals '{v}'")
-
-        return signals
-
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def _pre_root_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        grain = values.pop("grain", None)
+    def _pre_root_validator(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        grain = data.pop("grain", None)
         if grain:
-            grains = values.get("grains")
+            grains = data.get("grains")
             if grains:
                 raise ConfigError(
                     f"Cannot use argument 'grain' ({grain}) with 'grains' ({grains}), use only grains"
                 )
-            values["grains"] = ensure_list(grain)
+            data["grains"] = ensure_list(grain)
 
-        table_properties = values.pop("table_properties", None)
+        table_properties = data.pop("table_properties", None)
         if table_properties:
             if not isinstance(table_properties, str):
                 # Do not warn when deserializing from the state.
-                model_name = values["name"]
-                logger.warning(
+                model_name = data["name"]
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
                     f"Model '{model_name}' is using the `table_properties` attribute which is deprecated. Please use `physical_properties` instead."
                 )
-            physical_properties = values.get("physical_properties")
+            physical_properties = data.get("physical_properties")
             if physical_properties:
                 raise ConfigError(
                     f"Cannot use argument 'table_properties' ({table_properties}) with 'physical_properties' ({physical_properties}), use only physical_properties."
                 )
-            values["physical_properties"] = table_properties
-        return values
+
+            data["physical_properties"] = table_properties
+
+        return data
 
     @model_validator(mode="after")
-    @model_validator_v1_args
-    def _root_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        values = cls._kind_validator(values)
+    def _root_validator(self) -> Self:
+        kind: t.Any = self.kind
+
+        for field in ("partitioned_by_", "clustered_by"):
+            if (
+                getattr(self, field, None)
+                and not kind.is_materialized
+                and not (kind.is_view and kind.materialized)
+            ):
+                name = field[:-1] if field.endswith("_") else field
+                raise ValueError(f"{name} field cannot be set for {kind} models")
+        if kind.is_incremental_by_partition and not getattr(self, "partitioned_by_", None):
+            raise ValueError(f"partitioned_by field is required for {kind.name} models")
 
         # needs to be in a mode=after model validator so that the field validators have run to convert from Expression -> str
-        if (storage_format := values.get("storage_format")) and storage_format.lower() in {
+        if (storage_format := self.storage_format) and storage_format.lower() in {
             "iceberg",
             "hive",
             "hudi",
             "delta",
         }:
-            logger.warning(
-                f"Model {values['name']} has `storage_format` set to a table format '{storage_format}' which is deprecated. Please use the `table_format` property instead"
+            from sqlmesh.core.console import get_console
+
+            get_console().log_warning(
+                f"Model {self.name} has `storage_format` set to a table format '{storage_format}' which is deprecated. Please use the `table_format` property instead."
             )
 
-        return values
-
-    @classmethod
-    def _kind_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        kind = values.get("kind")
-        if kind:
-            for field in ("partitioned_by_", "clustered_by"):
-                if (
-                    values.get(field)
-                    and not kind.is_materialized
-                    and not (kind.is_view and kind.materialized)
-                ):
-                    raise ValueError(f"{field} field cannot be set for {kind} models")
-            if kind.is_incremental_by_partition and not values.get("partitioned_by_"):
-                raise ValueError(f"partitioned_by field is required for {kind.name} models")
-        return values
+        return self
 
     @property
     def time_column(self) -> t.Optional[TimeColumn]:
@@ -371,17 +356,6 @@ class ModelMeta(_Node):
         ):
             return self.kind.unique_key
         return []
-
-    @property
-    def partitioned_by(self) -> t.List[exp.Expression]:
-        """Columns to partition the model by, including the time column if it is not already included."""
-        if (
-            self.time_column
-            and self.time_column.column not in [col for col in self._partition_by_columns]
-            and self.dialect not in NO_PARTITIONED_TIME_COLUMN_DIALECTS
-        ):
-            return [self.time_column.column, *self.partitioned_by_]
-        return self.partitioned_by_
 
     @property
     def column_descriptions(self) -> t.Dict[str, str]:
@@ -447,17 +421,19 @@ class ModelMeta(_Node):
         ]
 
     @property
-    def _partition_by_columns(self) -> t.List[exp.Column]:
-        return [col for expr in self.partitioned_by_ for col in expr.find_all(exp.Column)]
-
-    @property
     def managed_columns(self) -> t.Dict[str, exp.DataType]:
         return getattr(self.kind, "managed_columns", {})
 
     @property
-    def when_matched(self) -> t.Optional[t.List[exp.When]]:
+    def when_matched(self) -> t.Optional[exp.Whens]:
         if isinstance(self.kind, IncrementalByUniqueKeyKind):
             return self.kind.when_matched
+        return None
+
+    @property
+    def merge_filter(self) -> t.Optional[exp.Expression]:
+        if isinstance(self.kind, IncrementalByUniqueKeyKind):
+            return self.kind.merge_filter
         return None
 
     @property
@@ -478,7 +454,3 @@ class ModelMeta(_Node):
     @property
     def on_destructive_change(self) -> OnDestructiveChange:
         return getattr(self.kind, "on_destructive_change", OnDestructiveChange.ALLOW)
-
-
-# dialects for which time_column should not automatically be added to partitioned_by
-NO_PARTITIONED_TIME_COLUMN_DIALECTS = {"clickhouse"}

@@ -5,13 +5,13 @@ import typing as t
 import unittest
 from collections import Counter
 from contextlib import AbstractContextManager, nullcontext
+from itertools import chain
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 from io import StringIO
-from freezegun import freeze_time
 from pandas.api.types import is_object_dtype
 from sqlglot import Dialect, exp
 from sqlglot.optimizer.annotate_types import annotate_types
@@ -23,7 +23,7 @@ from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.core.model import Model, PythonModel, SqlModel
 from sqlmesh.utils import UniqueKeyDict, random_id, type_is_known, yaml
-from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime
+from sqlmesh.utils.date import date_dict, pandas_timestamp_to_pydatetime, to_datetime
 from sqlmesh.utils.errors import ConfigError, TestError
 from sqlmesh.utils.yaml import load as yaml_load
 
@@ -31,6 +31,7 @@ if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
 
     Row = t.Dict[str, t.Any]
+
 
 TIME_KWARG_KEYS = {
     "start",
@@ -94,22 +95,37 @@ class ModelTest(unittest.TestCase):
         else:
             self._fixture_catalog = None
 
-        # The test schema name is randomized to avoid concurrency issues
-        self._fixture_schema = exp.to_identifier(f"sqlmesh_test_{random_id(short=True)}")
+        # The test schema name is randomized to avoid concurrency issues,
+        # unless a schema is provided in the unit tests's body
+        self._fixture_schema = exp.parse_identifier(
+            self.body.get("schema") or f"sqlmesh_test_{random_id(short=True)}"
+        )
         self._qualified_fixture_schema = schema_(self._fixture_schema, self._fixture_catalog)
 
         self._transforms = self._test_adapter_dialect.generator_class.TRANSFORMS
         self._execution_time = str(self.body.get("vars", {}).get("execution_time") or "")
+
+        if self._execution_time:
+            # Normalizes the execution time by converting it into UTC timezone
+            self._execution_time = str(to_datetime(self._execution_time))
 
         # When execution_time is set, we mock the CURRENT_* SQL expressions so they always return it
         if self._execution_time:
             exec_time = exp.Literal.string(self._execution_time)
             self._transforms = {
                 **self._transforms,
-                exp.CurrentDate: lambda self, _: self.sql(exp.cast(exec_time, "date")),
-                exp.CurrentDatetime: lambda self, _: self.sql(exp.cast(exec_time, "datetime")),
-                exp.CurrentTime: lambda self, _: self.sql(exp.cast(exec_time, "time")),
-                exp.CurrentTimestamp: lambda self, _: self.sql(exp.cast(exec_time, "timestamp")),
+                exp.CurrentDate: lambda self, _: self.sql(
+                    exp.cast(exec_time, "date", dialect=dialect)
+                ),
+                exp.CurrentDatetime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "datetime", dialect=dialect)
+                ),
+                exp.CurrentTime: lambda self, _: self.sql(
+                    exp.cast(exec_time, "time", dialect=dialect)
+                ),
+                exp.CurrentTimestamp: lambda self, _: self.sql(
+                    exp.cast(exec_time, "timestamp", dialect=dialect)
+                ),
             }
 
         super().__init__()
@@ -123,25 +139,25 @@ class ModelTest(unittest.TestCase):
 
         for name, values in self.body.get("inputs", {}).items():
             all_types_are_known = False
-            known_columns_to_types: t.Dict[str, exp.DataType] = {}
+            columns_to_known_types: t.Dict[str, exp.DataType] = {}
 
             model = self.models.get(name)
             if model:
                 inferred_columns_to_types = model.columns_to_types or {}
-                known_columns_to_types = {
+                columns_to_known_types = {
                     c: t for c, t in inferred_columns_to_types.items() if type_is_known(t)
                 }
                 all_types_are_known = bool(inferred_columns_to_types) and (
-                    len(known_columns_to_types) == len(inferred_columns_to_types)
+                    len(columns_to_known_types) == len(inferred_columns_to_types)
                 )
 
             # Types specified in the test will override the corresponding inferred ones
-            known_columns_to_types.update(values.get("columns", {}))
+            columns_to_known_types.update(values.get("columns", {}))
 
             rows = values.get("rows")
             if not all_types_are_known and rows:
                 for col, value in rows[0].items():
-                    if col not in known_columns_to_types:
+                    if col not in columns_to_known_types:
                         v_type = annotate_types(exp.convert(value)).type or type(value).__name__
                         v_type = exp.maybe_parse(
                             v_type, into=exp.DataType, dialect=self._test_adapter_dialect
@@ -156,21 +172,21 @@ class ModelTest(unittest.TestCase):
                                 self.path,
                             )
 
-                        known_columns_to_types[col] = v_type
+                        columns_to_known_types[col] = v_type
 
             if rows is None:
                 query_or_df: exp.Query | pd.DataFrame = self._add_missing_columns(
-                    values["query"], known_columns_to_types
+                    values["query"], columns_to_known_types
                 )
-                if known_columns_to_types:
-                    known_columns_to_types = {
-                        col: known_columns_to_types[col] for col in query_or_df.named_selects
+                if columns_to_known_types:
+                    columns_to_known_types = {
+                        col: columns_to_known_types[col] for col in query_or_df.named_selects
                     }
             else:
-                query_or_df = self._create_df(values, columns=known_columns_to_types)
+                query_or_df = self._create_df(values, columns=columns_to_known_types)
 
             self.engine_adapter.create_view(
-                self._test_fixture_table(name), query_or_df, known_columns_to_types
+                self._test_fixture_table(name), query_or_df, columns_to_known_types
             )
 
     def tearDown(self) -> None:
@@ -215,13 +231,21 @@ class ModelTest(unittest.TestCase):
             if is_object_dtype(actual_types[col]) and len(actual[col]) != 0
         }
         for col, value in object_sentinel_values.items():
-            # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
-            if type(value) is datetime.date:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.date  # type: ignore
-            elif type(value) is datetime.time:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.time  # type: ignore
-            elif type(value) is datetime.datetime:
-                expected[col] = pd.to_datetime(expected[col], errors="ignore").dt.to_pydatetime()  # type: ignore
+            try:
+                # can't use `isinstance()` here - https://stackoverflow.com/a/68743663/1707525
+                if type(value) is datetime.date:
+                    expected[col] = pd.to_datetime(expected[col]).dt.date
+                elif type(value) is datetime.time:
+                    expected[col] = pd.to_datetime(expected[col]).dt.time
+                elif type(value) is datetime.datetime:
+                    expected[col] = pd.to_datetime(expected[col]).dt.to_pydatetime()
+            except Exception as e:
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"Failed to convert expected value for {col} into `datetime` "
+                    f"for unit test '{str(self)}'. {str(e)}."
+                )
 
         actual = actual.replace({np.nan: None})
         expected = expected.replace({np.nan: None})
@@ -233,10 +257,11 @@ class ModelTest(unittest.TestCase):
                 return tuple((k, _to_hashable(v)) for k, v in x.items())
             return str(x) if not isinstance(x, t.Hashable) else x
 
+        actual = actual.apply(lambda col: col.map(_to_hashable))
+        expected = expected.apply(lambda col: col.map(_to_hashable))
+
         if sort:
-            actual = actual.apply(lambda col: col.map(_to_hashable))
             actual = actual.sort_values(by=actual.columns.to_list()).reset_index(drop=True)
-            expected = expected.apply(lambda col: col.map(_to_hashable))
             expected = expected.sort_values(by=expected.columns.to_list()).reset_index(drop=True)
 
         try:
@@ -285,7 +310,7 @@ class ModelTest(unittest.TestCase):
         path: Path | None,
         preserve_fixtures: bool = False,
         default_catalog: str | None = None,
-    ) -> ModelTest:
+    ) -> t.Optional[ModelTest]:
         """Create a SqlModelTest or a PythonModelTest.
 
         Args:
@@ -304,7 +329,12 @@ class ModelTest(unittest.TestCase):
         name = normalize_model_name(name, default_catalog=default_catalog, dialect=dialect)
         model = models.get(name)
         if not model:
-            _raise_error(f"Model '{name}' was not found", path)
+            from sqlmesh.core.console import get_console
+
+            get_console().log_warning(
+                f"Model '{name}' was not found{' at ' + str(path) if path else ''}"
+            )
+            return None
 
         if isinstance(model, SqlModel):
             test_type: t.Type[ModelTest] = SqlModelTest
@@ -522,7 +552,7 @@ class ModelTest(unittest.TestCase):
 
 
 class SqlModelTest(ModelTest):
-    def test_ctes(self, ctes: t.Dict[str, exp.Expression]) -> None:
+    def test_ctes(self, ctes: t.Dict[str, exp.Expression], recursive: bool = False) -> None:
         """Run CTE queries and compare output to expected output"""
         for cte_name, values in self.body["outputs"].get("ctes", {}).items():
             with self.subTest(cte=cte_name):
@@ -532,11 +562,13 @@ class SqlModelTest(ModelTest):
                     )
 
                 cte_query = ctes[cte_name].this
-                for alias, cte in ctes.items():
-                    cte_query = cte_query.with_(alias, cte.this)
 
-                partial = values.get("partial")
                 sort = cte_query.args.get("order") is None
+                partial = values.get("partial")
+
+                cte_query = exp.select(*_projection_identifiers(cte_query)).from_(cte_name)
+                for alias, cte in ctes.items():
+                    cte_query = cte_query.with_(alias, cte.this, recursive=recursive)
 
                 actual = self._execute(cte_query)
                 expected = self._create_df(values, columns=cte_query.named_selects, partial=partial)
@@ -545,13 +577,16 @@ class SqlModelTest(ModelTest):
 
     def runTest(self) -> None:
         query = self._render_model_query()
+        with_clause = query.args.get("with")
 
-        self.test_ctes(
-            {
-                self._normalize_model_name(cte.alias, with_default_catalog=False): cte
-                for cte in query.ctes
-            }
-        )
+        if with_clause:
+            self.test_ctes(
+                {
+                    self._normalize_model_name(cte.alias, with_default_catalog=False): cte
+                    for cte in query.ctes
+                },
+                recursive=with_clause.recursive,
+            )
 
         values = self.body["outputs"].get("query")
         if values is not None:
@@ -639,9 +674,15 @@ class PythonModelTest(ModelTest):
 
     def _execute_model(self) -> pd.DataFrame:
         """Executes the python model and returns a DataFrame."""
-        time_ctx = freeze_time(self._execution_time) if self._execution_time else nullcontext()
+        if self._execution_time:
+            import time_machine
+
+            time_ctx: AbstractContextManager = time_machine.travel(self._execution_time, tick=False)
+        else:
+            time_ctx = nullcontext()
+
         with patch.dict(self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms):
-            with t.cast(AbstractContextManager, time_ctx):
+            with time_ctx:
                 variables = self.body.get("vars", {}).copy()
                 time_kwargs = {
                     key: variables.pop(key) for key in TIME_KWARG_KEYS if key in variables
@@ -699,7 +740,7 @@ def generate_test(
     # ruamel.yaml does not support pandas Timestamps, so we must convert them to python
     # datetime or datetime.date objects based on column type
     inputs = {
-        models[dep].name: pandas_timestamp_to_pydatetime(
+        dep: pandas_timestamp_to_pydatetime(
             engine_adapter.fetchdf(query).apply(lambda col: col.map(_normalize_df_value)),
             models[dep].columns_to_types,
         )
@@ -709,7 +750,7 @@ def generate_test(
     }
     outputs: t.Dict[str, t.Any] = {"query": {}}
     variables = variables or {}
-    test_body = {"model": model.name, "inputs": inputs, "outputs": outputs}
+    test_body = {"model": model.fqn, "inputs": inputs, "outputs": outputs}
 
     if variables:
         test_body["vars"] = variables
@@ -723,20 +764,31 @@ def generate_test(
         path=fixture_path,
         default_catalog=model.default_catalog,
     )
+    if not test:
+        return
 
     test.setUp()
 
     if isinstance(model, SqlModel):
         assert isinstance(test, SqlModelTest)
         model_query = test._render_model_query()
+        with_clause = model_query.args.get("with")
 
-        if include_ctes:
+        if with_clause and include_ctes:
             ctes = {}
+            recursive = with_clause.recursive
             previous_ctes: t.List[exp.CTE] = []
+
             for cte in model_query.ctes:
                 cte_query = cte.this
-                for prev in previous_ctes:
-                    cte_query = cte_query.with_(prev.alias, prev.this)
+                cte_identifier = cte.args["alias"].this
+
+                cte_query = exp.select(*_projection_identifiers(cte_query)).from_(cte_identifier)
+
+                for prev in chain(previous_ctes, [cte]):
+                    cte_query = cte_query.with_(
+                        prev.args["alias"].this, prev.this, recursive=recursive
+                    )
 
                 cte_output = test._execute(cte_query)
                 ctes[cte.alias] = (
@@ -770,6 +822,19 @@ def generate_test(
     fixture_path.parent.mkdir(exist_ok=True, parents=True)
     with open(fixture_path, "w", encoding="utf-8") as file:
         yaml.dump({test_name: test_body}, file)
+
+
+def _projection_identifiers(query: exp.Query) -> t.List[str | exp.Identifier]:
+    identifiers: t.List[str | exp.Identifier] = []
+    for select in query.selects:
+        if isinstance(select, exp.Alias):
+            identifiers.append(select.args["alias"])
+        elif isinstance(select, exp.Column):
+            identifiers.append(select.this)
+        else:
+            identifiers.append(select.output_name)
+
+    return identifiers
 
 
 def _raise_if_unexpected_columns(

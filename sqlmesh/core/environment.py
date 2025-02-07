@@ -101,6 +101,7 @@ class Environment(EnvironmentNamingInfo):
         promoted_snapshot_ids: The IDs of the snapshots that are promoted in this environment
             (i.e. for which the views are created). If not specified, all snapshots are promoted.
         previous_finalized_snapshots: Snapshots that were part of this environment last time it was finalized.
+        requirements: A mapping of library versions for all the snapshots in this environment.
     """
 
     snapshots_: t.List[t.Any] = Field(alias="snapshots")
@@ -116,6 +117,7 @@ class Environment(EnvironmentNamingInfo):
     previous_finalized_snapshots_: t.Optional[t.List[t.Any]] = Field(
         default=None, alias="previous_finalized_snapshots"
     )
+    requirements: t.Dict[str, str] = {}
 
     @field_validator("snapshots_", "previous_finalized_snapshots_", mode="before")
     @classmethod
@@ -135,15 +137,21 @@ class Environment(EnvironmentNamingInfo):
             raise ValueError("Must be a list of SnapshotId dicts or objects")
         return v
 
+    @field_validator("requirements", mode="before")
+    def _load_requirements(cls, v: t.Any) -> t.Any:
+        if isinstance(v, str):
+            v = json.loads(v)
+        return v or {}
+
     @property
     def snapshots(self) -> t.List[SnapshotTableInfo]:
-        return self._convert_list_to_models_and_store("snapshots_", SnapshotTableInfo)
+        return self._convert_list_to_models_and_store("snapshots_", SnapshotTableInfo) or []
 
     def snapshot_dicts(self) -> t.List[dict]:
         return self._convert_list_to_dicts(self.snapshots_)
 
     @property
-    def promoted_snapshot_ids(self) -> t.List[SnapshotId]:
+    def promoted_snapshot_ids(self) -> t.Optional[t.List[SnapshotId]]:
         return self._convert_list_to_models_and_store("promoted_snapshot_ids_", SnapshotId)
 
     def promoted_snapshot_id_dicts(self) -> t.List[dict]:
@@ -158,7 +166,7 @@ class Environment(EnvironmentNamingInfo):
         return [s for s in self.snapshots if s.snapshot_id in promoted_snapshot_ids]
 
     @property
-    def previous_finalized_snapshots(self) -> t.List[SnapshotTableInfo]:
+    def previous_finalized_snapshots(self) -> t.Optional[t.List[SnapshotTableInfo]]:
         return self._convert_list_to_models_and_store(
             "previous_finalized_snapshots_", SnapshotTableInfo
         )
@@ -189,12 +197,12 @@ class Environment(EnvironmentNamingInfo):
 
     def _convert_list_to_models_and_store(
         self, field: str, type_: t.Type[PydanticType]
-    ) -> t.List[PydanticType]:
+    ) -> t.Optional[t.List[PydanticType]]:
         value = getattr(self, field)
         if value and not isinstance(value[0], type_):
             value = [type_.parse_obj(obj) for obj in value]
             setattr(self, field, value)
-        return t.cast(t.List[PydanticType], value)
+        return value
 
     def _convert_list_to_dicts(self, value: t.Optional[t.List[t.Any]]) -> t.List[dict]:
         if not value:

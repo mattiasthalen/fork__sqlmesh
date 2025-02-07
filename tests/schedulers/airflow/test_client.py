@@ -65,6 +65,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
         environment=environment,
         no_gaps=False,
         skip_backfill=False,
+        empty_backfill=False,
         restatements={snapshot.name: (to_timestamp("2024-01-01"), to_timestamp("2024-01-02"))},
         is_dev=False,
         allow_destructive_models=set(),
@@ -97,8 +98,10 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                     "fingerprint": snapshot.fingerprint.dict(),
                     "intervals": [],
                     "dev_intervals": [],
+                    "pending_restatement_intervals": [],
                     "node": {
                         "audits": [],
+                        "audit_definitions": {},
                         "clustered_by": [],
                         "cron": "@daily",
                         "dialect": "spark",
@@ -112,12 +115,12 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                             "dialect": "spark",
                         },
                         "mapping_schema": {},
-                        "inline_audits": {},
                         "name": "test_model",
                         "partitioned_by": ["`a`"],
                         "query": "SELECT a, ds FROM tbl",
                         "references": [],
                         "project": "",
+                        "python_env": {},
                         "storage_format": "parquet",
                         "jinja_macros": {
                             "create_builtins_module": "sqlmesh.utils.jinja",
@@ -132,8 +135,8 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                         "allow_partials": False,
                         "signals": [],
                         "enabled": True,
+                        "extract_dependencies_from_query": True,
                     },
-                    "audits": [],
                     "name": '"test_model"',
                     "parents": [],
                     "previous_versions": [],
@@ -171,16 +174,20 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                 ],
                 "suffix_target": "schema",
                 "normalize_name": True,
+                "requirements": {},
             },
             "no_gaps": False,
             "skip_backfill": False,
+            "empty_backfill": False,
             "is_dev": False,
             "forward_only": False,
             "allow_destructive_models": [],
             "models_to_backfill": ['"test_model"'],
             "end_bounded": False,
             "ensure_finalized_snapshots": False,
-            "directly_modified_snapshots": [{"identifier": "4011362914", "name": '"test_model"'}],
+            "directly_modified_snapshots": [
+                {"identifier": snapshot.identifier, "name": '"test_model"'}
+            ],
             "indirectly_modified_snapshots": {},
             "removed_snapshots": [],
             "restatements": {
@@ -284,7 +291,8 @@ def test_get_environment(mocker: MockerFixture, snapshot: Snapshot):
     client = AirflowClient(airflow_url=common.AIRFLOW_LOCAL_URL, session=requests.Session())
     result = client.get_environment("dev")
 
-    assert result == environment
+    assert result is not None
+    assert result.dict() == environment.dict()
 
     get_environment_mock.assert_called_once_with(
         "http://localhost:8080/sqlmesh/api/v1/environments/dev"
@@ -311,7 +319,8 @@ def test_get_environments(mocker: MockerFixture, snapshot: Snapshot):
     client = AirflowClient(airflow_url=common.AIRFLOW_LOCAL_URL, session=requests.Session())
     result = client.get_environments()
 
-    assert result == [environment]
+    assert len(result) == 1
+    assert result[0].dict() == environment.dict()
 
     get_environments_mock.assert_called_once_with(
         "http://localhost:8080/sqlmesh/api/v1/environments"

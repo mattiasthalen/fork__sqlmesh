@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import typing as t
 
-from sqlglot import exp
+from sqlglot import exp, parse_one
+from sqlglot.helper import seq_get
 
 from sqlmesh.core.engine_adapter.base import EngineAdapter
 from sqlmesh.core.engine_adapter.shared import InsertOverwriteStrategy, SourceQuery
 from sqlmesh.core.node import IntervalUnit
+from sqlmesh.core.dialect import schema_
 from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
@@ -17,6 +19,9 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+NORMALIZED_DATE_FORMAT = "%Y-%m-%d"
+NORMALIZED_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
 
 class LogicalMergeMixin(EngineAdapter):
     def merge(
@@ -25,24 +30,17 @@ class LogicalMergeMixin(EngineAdapter):
         source_table: QueryOrDF,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
         unique_key: t.Sequence[exp.Expression],
-        when_matched: t.Optional[t.Union[exp.When, t.List[exp.When]]] = None,
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
     ) -> None:
-        """
-        Merge implementation for engine adapters that do not support merge natively.
-
-        The merge is executed as follows:
-        1. Create a temporary table containing the new data to merge.
-        2. Delete rows from target table where unique_key cols match a row in the temporary table.
-        3. Insert the temporary table contents into the target table. Any duplicate, non-unique rows
-           within the temporary table are ommitted.
-        4. Drop the temporary table.
-        """
-        if when_matched:
-            raise SQLMeshError(
-                "This engine does not support MERGE expressions and therefore `when_matched` is not supported."
-            )
-        self._replace_by_key(
-            target_table, source_table, columns_to_types, unique_key, is_unique_key=True
+        logical_merge(
+            self,
+            target_table,
+            source_table,
+            columns_to_types,
+            unique_key,
+            when_matched=when_matched,
+            merge_filter=merge_filter,
         )
 
 
@@ -79,6 +77,7 @@ class InsertOverwriteWithMergeMixin(EngineAdapter):
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         where: t.Optional[exp.Condition] = None,
         insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
+        **kwargs: t.Any,
     ) -> None:
         """
         Some engines do not support `INSERT OVERWRITE` but instead support
@@ -108,7 +107,9 @@ class InsertOverwriteWithMergeMixin(EngineAdapter):
                     target_table=table_name,
                     query=query,
                     on=exp.false(),
-                    match_expressions=[when_not_matched_by_source, when_not_matched_by_target],
+                    whens=exp.Whens(
+                        expressions=[when_not_matched_by_source, when_not_matched_by_target]
+                    ),
                 )
 
 
@@ -153,7 +154,7 @@ class HiveMetastoreTablePropertiesMixin(EngineAdapter):
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -303,6 +304,7 @@ class VarcharSizeWorkaroundMixin(EngineAdapter):
                 select_or_union.set("where", None)
 
             temp_view_name = self._get_temp_table("ctas")
+
             self.create_view(
                 temp_view_name, select_statement, replace=False, no_schema_binding=False
             )
@@ -333,7 +335,216 @@ class VarcharSizeWorkaroundMixin(EngineAdapter):
 class ClusteredByMixin(EngineAdapter):
     def _build_clustered_by_exp(
         self,
-        clustered_by: t.List[str],
+        clustered_by: t.List[exp.Expression],
         **kwargs: t.Any,
     ) -> t.Optional[exp.Cluster]:
-        return exp.Cluster(expressions=[exp.column(col) for col in clustered_by])
+        return exp.Cluster(expressions=[c.copy() for c in clustered_by])
+
+    def _parse_clustering_key(self, clustering_key: t.Optional[str]) -> t.List[exp.Expression]:
+        if not clustering_key:
+            return []
+
+        # Note: Assumes `clustering_key` as a string like:
+        # - "(col_a)"
+        # - "(col_a, col_b)"
+        # - "func(col_a, transform(col_b))"
+        parsed_cluster_key = parse_one(clustering_key, dialect=self.dialect)
+
+        return parsed_cluster_key.expressions or [parsed_cluster_key.this]
+
+    def get_alter_expressions(
+        self, current_table_name: TableName, target_table_name: TableName
+    ) -> t.List[exp.Alter]:
+        expressions = super().get_alter_expressions(current_table_name, target_table_name)
+
+        # check for a change in clustering
+        current_table = exp.to_table(current_table_name)
+        target_table = exp.to_table(target_table_name)
+
+        current_table_schema = schema_(current_table.db, catalog=current_table.catalog)
+        target_table_schema = schema_(target_table.db, catalog=target_table.catalog)
+
+        current_table_info = seq_get(
+            self.get_data_objects(current_table_schema, {current_table.name}), 0
+        )
+        target_table_info = seq_get(
+            self.get_data_objects(target_table_schema, {target_table.name}), 0
+        )
+
+        if current_table_info and target_table_info:
+            if target_table_info.is_clustered:
+                if target_table_info.clustering_key and (
+                    current_table_info.clustering_key != target_table_info.clustering_key
+                ):
+                    expressions.append(
+                        self._change_clustering_key_expr(
+                            current_table,
+                            self._parse_clustering_key(target_table_info.clustering_key),
+                        )
+                    )
+            elif current_table_info.is_clustered:
+                expressions.append(self._drop_clustering_key_expr(current_table))
+
+        return expressions
+
+    def _change_clustering_key_expr(
+        self, table: exp.Table, cluster_by: t.List[exp.Expression]
+    ) -> exp.Alter:
+        return exp.Alter(
+            this=table,
+            kind="TABLE",
+            actions=[exp.Cluster(expressions=cluster_by)],
+        )
+
+    def _drop_clustering_key_expr(self, table: exp.Table) -> exp.Alter:
+        return exp.Alter(
+            this=table,
+            kind="TABLE",
+            actions=[exp.Command(this="DROP", expression="CLUSTERING KEY")],
+        )
+
+
+def logical_merge(
+    engine_adapter: EngineAdapter,
+    target_table: TableName,
+    source_table: QueryOrDF,
+    columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+    unique_key: t.Sequence[exp.Expression],
+    when_matched: t.Optional[exp.Whens] = None,
+    merge_filter: t.Optional[exp.Expression] = None,
+) -> None:
+    """
+    Merge implementation for engine adapters that do not support merge natively.
+
+    The merge is executed as follows:
+    1. Create a temporary table containing the new data to merge.
+    2. Delete rows from target table where unique_key cols match a row in the temporary table.
+    3. Insert the temporary table contents into the target table. Any duplicate, non-unique rows
+       within the temporary table are ommitted.
+    4. Drop the temporary table.
+    """
+    if when_matched or merge_filter:
+        prop = "when_matched" if when_matched else "merge_filter"
+        raise SQLMeshError(
+            f"This engine does not support MERGE expressions and therefore `{prop}` is not supported."
+        )
+
+    engine_adapter._replace_by_key(
+        target_table, source_table, columns_to_types, unique_key, is_unique_key=True
+    )
+
+
+class RowDiffMixin(EngineAdapter):
+    # The maximum supported value for n in timestamp(n).
+    # Most databases are microsecond (6) but some can only handle millisecond (3) while others go to nanosecond (9)
+    MAX_TIMESTAMP_PRECISION = 6
+
+    def concat_columns(
+        self,
+        columns_to_types: t.Dict[str, exp.DataType],
+        decimal_precision: int = 3,
+        timestamp_precision: int = MAX_TIMESTAMP_PRECISION,
+        delimiter: str = ",",
+    ) -> exp.Expression:
+        """
+        Produce an expression that generates a string version of a record, that is:
+            - Every column converted to a string representation, joined together into a single string using the specified :delimiter
+        """
+        expressions_to_concat: t.List[exp.Expression] = []
+        for idx, (column, type) in enumerate(columns_to_types.items()):
+            expressions_to_concat.append(
+                exp.func(
+                    "COALESCE",
+                    self.normalize_value(
+                        exp.to_column(column), type, decimal_precision, timestamp_precision
+                    ),
+                    exp.Literal.string(""),
+                )
+            )
+            if idx < len(columns_to_types) - 1:
+                expressions_to_concat.append(exp.Literal.string(delimiter))
+
+        return exp.func("CONCAT", *expressions_to_concat)
+
+    def normalize_value(
+        self,
+        expr: exp.Expression,
+        type: exp.DataType,
+        decimal_precision: int = 3,
+        timestamp_precision: int = MAX_TIMESTAMP_PRECISION,
+    ) -> exp.Expression:
+        """
+        Return an expression that converts the values inside the column `col` to a normalized string
+
+        This string should be comparable across database engines, eg:
+            - `date` columns -> YYYY-MM-DD string
+            - `datetime`/`timestamp`/`timestamptz` columns -> ISO-8601 string to :timestamp_precision digits of subsecond precision
+            - `float` / `double` / `decimal` -> Value formatted to :decimal_precision decimal places
+            - `boolean` columns -> '1' or '0'
+            - NULLS -> "" (empty string)
+        """
+        if type.is_type(exp.DataType.Type.BOOLEAN):
+            value = self._normalize_boolean_value(expr)
+        elif type.is_type(*exp.DataType.INTEGER_TYPES):
+            value = self._normalize_integer_value(expr)
+        elif type.is_type(*exp.DataType.REAL_TYPES):
+            # If there is no scale on the decimal type, treat it like an integer when comparing
+            # Some databases like Snowflake deliberately create all integer types as NUMERIC(<size>, 0)
+            # and they should be treated as integers and not decimals
+            type_params = list(type.find_all(exp.DataTypeParam))
+            if len(type_params) == 2 and type_params[-1].this.to_py() == 0:
+                value = self._normalize_integer_value(expr)
+            else:
+                value = self._normalize_decimal_value(expr, decimal_precision)
+        elif type.is_type(*exp.DataType.TEMPORAL_TYPES):
+            value = self._normalize_timestamp_value(expr, type, timestamp_precision)
+        elif type.is_type(*exp.DataType.NESTED_TYPES):
+            value = self._normalize_nested_value(expr)
+        else:
+            value = expr
+
+        return exp.cast(value, to=exp.DataType.build("VARCHAR"))
+
+    def _normalize_nested_value(self, expr: exp.Expression) -> exp.Expression:
+        return expr
+
+    def _normalize_timestamp_value(
+        self, expr: exp.Expression, type: exp.DataType, precision: int
+    ) -> exp.Expression:
+        if precision > self.MAX_TIMESTAMP_PRECISION:
+            raise ValueError(
+                f"Requested timestamp precision '{precision}' exceeds maximum supported precision: {self.MAX_TIMESTAMP_PRECISION}"
+            )
+
+        is_date = type.is_type(exp.DataType.Type.DATE, exp.DataType.Type.DATE32)
+
+        format = NORMALIZED_DATE_FORMAT if is_date else NORMALIZED_TIMESTAMP_FORMAT
+
+        if type.is_type(
+            exp.DataType.Type.TIMESTAMPTZ,
+            exp.DataType.Type.TIMESTAMPLTZ,
+            exp.DataType.Type.TIMESTAMPNTZ,
+        ):
+            # Convert all timezone-aware values to UTC for comparison
+            expr = exp.AtTimeZone(this=expr, zone=exp.Literal.string("UTC"))
+
+        digits_to_chop_off = (
+            6 - precision
+        )  # 6 = max precision across all adapters and also the max amount of digits TimeToStr will render since its based on `strftime` and `%f` only renders to microseconds
+
+        expr = exp.TimeToStr(this=expr, format=exp.Literal.string(format))
+        if digits_to_chop_off > 0:
+            expr = exp.func(
+                "SUBSTRING", expr, 1, len("2023-01-01 12:13:14.000000") - digits_to_chop_off
+            )
+
+        return expr
+
+    def _normalize_integer_value(self, expr: exp.Expression) -> exp.Expression:
+        return exp.cast(expr, "BIGINT")
+
+    def _normalize_decimal_value(self, expr: exp.Expression, precision: int) -> exp.Expression:
+        return exp.cast(expr, f"DECIMAL(38,{precision})")
+
+    def _normalize_boolean_value(self, expr: exp.Expression) -> exp.Expression:
+        return exp.cast(expr, "INT")

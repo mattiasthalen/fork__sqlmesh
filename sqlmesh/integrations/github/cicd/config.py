@@ -1,4 +1,3 @@
-import sys
 import typing as t
 from enum import Enum
 
@@ -7,12 +6,7 @@ from pydantic import Field
 from sqlmesh.core.config import CategorizerConfig
 from sqlmesh.core.config.base import BaseConfig
 from sqlmesh.utils.date import TimeLike
-from sqlmesh.utils.pydantic import model_validator, model_validator_v1_args
-
-if sys.version_info >= (3, 9):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
+from sqlmesh.utils.pydantic import model_validator
 
 
 class MergeMethod(str, Enum):
@@ -22,7 +16,7 @@ class MergeMethod(str, Enum):
 
 
 class GithubCICDBotConfig(BaseConfig):
-    type_: Literal["github"] = Field(alias="type", default="github")
+    type_: t.Literal["github"] = Field(alias="type", default="github")
 
     invalidate_environment_after_deploy: bool = True
     enable_deploy_command: bool = False
@@ -32,17 +26,21 @@ class GithubCICDBotConfig(BaseConfig):
     default_pr_start: t.Optional[TimeLike] = None
     skip_pr_backfill: bool = True
     pr_include_unmodified: t.Optional[bool] = None
-    run_on_deploy_to_prod: bool = True
+    run_on_deploy_to_prod: bool = False
     pr_environment_name: t.Optional[str] = None
 
     @model_validator(mode="before")
-    @model_validator_v1_args
-    def _validate(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
-        if values.get("enable_deploy_command") and not values.get("merge_method"):
+    @classmethod
+    def _validate(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+
+        if data.get("enable_deploy_command") and not data.get("merge_method"):
             raise ValueError("merge_method must be set if enable_deploy_command is True")
-        if values.get("command_namespace") and not values.get("enable_deploy_command"):
+        if data.get("command_namespace") and not data.get("enable_deploy_command"):
             raise ValueError("enable_deploy_command must be set if command_namespace is set")
-        return values
+
+        return data
 
     FIELDS_FOR_ANALYTICS: t.ClassVar[t.Set[str]] = {
         "invalidate_environment_after_deploy",

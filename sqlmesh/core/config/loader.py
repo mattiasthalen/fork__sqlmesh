@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import os
 import typing as t
 from pathlib import Path
@@ -27,7 +28,9 @@ def load_configs(
     config = config or "config"
 
     absolute_paths = [
-        Path(t.cast(t.Union[str, Path], path)).absolute() for path in ensure_list(paths)
+        Path(t.cast(t.Union[str, Path], p)).absolute()
+        for path in ensure_list(paths)
+        for p in (glob.glob(str(path)) or [str(path)])
     ]
 
     if not isinstance(config, str):
@@ -172,7 +175,7 @@ def load_config_from_env() -> t.Dict[str, t.Any]:
 
     for key, value in os.environ.items():
         key = key.lower()
-        if key.startswith(f"{c.SQLMESH}__"):
+        if key.startswith(f"{c.SQLMESH}__") and key != (c.DISABLE_SQLMESH_STATE_MIGRATION).lower():
             segments = key.split("__")[1:]
             if not segments or not segments[-1]:
                 raise ConfigError(f"Invalid SQLMesh configuration variable '{key}'.")

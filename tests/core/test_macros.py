@@ -101,7 +101,7 @@ def macro_evaluator() -> MacroEvaluator:
 
 def test_star(assert_exp_eq) -> None:
     sql = """SELECT @STAR(foo) FROM foo"""
-    expected_sql = """SELECT CAST([foo].[a] AS DATETIMEOFFSET) AS [a], CAST([foo].[b] AS INTEGER) AS [b] FROM foo"""
+    expected_sql = "SELECT CAST([foo].[a] AS DATETIMEOFFSET) AS [a], CAST([foo].[b] AS INTEGER) AS [b] FROM foo"
     schema = MappingSchema(
         {
             "foo": {
@@ -114,7 +114,7 @@ def test_star(assert_exp_eq) -> None:
     evaluator = MacroEvaluator(schema=schema, dialect="tsql")
     assert_exp_eq(evaluator.transform(parse_one(sql, read="tsql")), expected_sql, dialect="tsql")
 
-    sql = """SELECT @STAR(foo, exclude := [SomeColumn]) FROM foo"""
+    sql = "SELECT @STAR(foo, exclude := [SomeColumn]) FROM foo"
     expected_sql = "SELECT CAST(`foo`.`a` AS STRING) AS `a` FROM foo"
     schema = MappingSchema(
         {
@@ -130,6 +130,72 @@ def test_star(assert_exp_eq) -> None:
         evaluator.transform(parse_one(sql, read="databricks")),
         expected_sql,
         dialect="databricks",
+    )
+
+    sql = "SELECT @STAR(foo, exclude := ARRAY(b)) FROM foo"
+    expected_sql = "SELECT [foo].[a] AS [a] FROM foo"
+    schema = MappingSchema(
+        {
+            "foo": {
+                "a": exp.DataType.build("unknown"),
+                "b": "int",
+            },
+        },
+        dialect="tsql",
+    )
+    evaluator = MacroEvaluator(schema=schema, dialect="tsql")
+    assert_exp_eq(evaluator.transform(parse_one(sql, read="tsql")), expected_sql, dialect="tsql")
+
+    sql = """SELECT @STAR(foo) FROM foo"""
+    expected_sql = (
+        """SELECT CAST("FOO"."A" AS DATE) AS "A", CAST("FOO"."B" AS INTEGER) AS "B" FROM foo"""
+    )
+    schema = MappingSchema(
+        {
+            "foo": {
+                "a": exp.DataType.build("date", dialect="snowflake"),
+                "b": "int",
+            },
+        },
+        dialect="snowflake",
+    )
+    evaluator = MacroEvaluator(schema=schema, dialect="snowflake")
+    assert_exp_eq(
+        evaluator.transform(parse_one(sql, read="snowflake")), expected_sql, dialect="snowflake"
+    )
+
+    sql = """SELECT @STAR("foo") FROM "foo" """
+    expected_sql = (
+        """SELECT CAST("foo"."A" AS DATE) AS "A", CAST("foo"."B" AS INTEGER) AS "B" FROM "foo" """
+    )
+    schema = MappingSchema(
+        {
+            '"foo"': {
+                "a": exp.DataType.build("date", dialect="snowflake"),
+                "b": "int",
+            },
+        },
+        dialect="snowflake",
+    )
+    evaluator = MacroEvaluator(schema=schema, dialect="snowflake")
+    assert_exp_eq(
+        evaluator.transform(parse_one(sql, read="snowflake")), expected_sql, dialect="snowflake"
+    )
+
+    sql = """SELECT @STAR(foo, alias := "bar") FROM foo "bar" """
+    expected_sql = """SELECT CAST("bar"."A" AS DATE) AS "A", CAST("bar"."B" AS INTEGER) AS "B" FROM foo "bar" """
+    schema = MappingSchema(
+        {
+            "foo": {
+                "a": exp.DataType.build("date", dialect="snowflake"),
+                "b": "int",
+            },
+        },
+        dialect="snowflake",
+    )
+    evaluator = MacroEvaluator(schema=schema, dialect="snowflake")
+    assert_exp_eq(
+        evaluator.transform(parse_one(sql, read="snowflake")), expected_sql, dialect="snowflake"
     )
 
 

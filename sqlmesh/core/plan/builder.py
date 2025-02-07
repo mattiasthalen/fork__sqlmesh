@@ -5,7 +5,6 @@ import re
 import sys
 import typing as t
 from collections import defaultdict
-from datetime import datetime
 from functools import cached_property
 
 
@@ -18,17 +17,17 @@ from sqlmesh.core.config import (
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.plan.definition import Plan, SnapshotMapping, earliest_interval_start
-from sqlmesh.core.schema_diff import SchemaDiffer, has_drop_alteration
+from sqlmesh.core.schema_diff import SchemaDiffer, has_drop_alteration, get_dropped_column_names
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
     SnapshotChangeCategory,
 )
 from sqlmesh.core.snapshot.categorizer import categorize_change
-from sqlmesh.core.snapshot.definition import Interval, SnapshotId, start_date
+from sqlmesh.core.snapshot.definition import Interval, SnapshotId
 from sqlmesh.utils import columns_to_types_all_known, random_id
 from sqlmesh.utils.dag import DAG
-from sqlmesh.utils.date import TimeLike, now, to_datetime, yesterday_ds
+from sqlmesh.utils.date import TimeLike, now, to_datetime, yesterday_ds, to_timestamp
 from sqlmesh.utils.errors import NoChangesPlanError, PlanError, SQLMeshError
 
 logger = logging.getLogger(__name__)
@@ -51,6 +50,7 @@ class PlanBuilder:
             part of the target environment have no data gaps when compared against previous
             snapshots for same nodes.
         skip_backfill: Whether to skip the backfill step.
+        empty_backfill: Like skip_backfill, but also records processed intervals.
         is_dev: Whether this plan is for development purposes.
         forward_only: Whether the purpose of the plan is to make forward only changes.
         allow_destructive_models: A list of fully qualified model names whose forward-only changes are allowed to be destructive.
@@ -84,6 +84,7 @@ class PlanBuilder:
         backfill_models: t.Optional[t.Iterable[str]] = None,
         no_gaps: bool = False,
         skip_backfill: bool = False,
+        empty_backfill: bool = False,
         is_dev: bool = False,
         forward_only: bool = False,
         allow_destructive_models: t.Optional[t.Iterable[str]] = None,
@@ -105,6 +106,7 @@ class PlanBuilder:
         self._context_diff = context_diff
         self._no_gaps = no_gaps
         self._skip_backfill = skip_backfill
+        self._empty_backfill = empty_backfill
         self._is_dev = is_dev
         self._forward_only = forward_only
         self._allow_destructive_models = set(
@@ -129,7 +131,9 @@ class PlanBuilder:
         self._choices: t.Dict[SnapshotId, SnapshotChangeCategory] = {}
 
         self._start = start
-        if not self._start and self._forward_only_preview_needed:
+        if not self._start and (
+            self._forward_only_preview_needed or self._auto_restatement_preview_needed
+        ):
             self._start = default_start or yesterday_ds()
 
         self._plan_id: str = random_id()
@@ -229,33 +233,15 @@ class PlanBuilder:
         self._adjust_new_snapshot_intervals()
 
         deployability_index = (
-            DeployabilityIndex.create(self._context_diff.snapshots.values())
+            DeployabilityIndex.create(self._context_diff.snapshots.values(), start=self._start)
             if self._is_dev
             else DeployabilityIndex.all_deployable()
         )
 
-        filtered_dag, ignored = self._build_filtered_dag(dag, deployability_index)
-
-        # Exclude ignored snapshots from the modified sets.
-        directly_modified = {s_id for s_id in directly_modified if s_id not in ignored}
-        for s_id in list(indirectly_modified):
-            if s_id in ignored:
-                indirectly_modified.pop(s_id, None)
-            else:
-                indirectly_modified[s_id] = {
-                    s_id for s_id in indirectly_modified[s_id] if s_id not in ignored
-                }
-
-        filtered_snapshots = {
-            s.snapshot_id: s
-            for s in self._context_diff.snapshots.values()
-            if s.snapshot_id not in ignored
-        }
-
-        models_to_backfill = self._build_models_to_backfill(filtered_dag)
         restatements = self._build_restatements(
-            dag, earliest_interval_start(filtered_snapshots.values())
+            dag, earliest_interval_start(self._context_diff.snapshots.values())
         )
+        models_to_backfill = self._build_models_to_backfill(dag, restatements)
 
         interval_end_per_model = self._interval_end_per_model
         if interval_end_per_model and self.override_end:
@@ -270,6 +256,7 @@ class PlanBuilder:
             provided_end=self._end,
             is_dev=self._is_dev,
             skip_backfill=self._skip_backfill,
+            empty_backfill=self._empty_backfill,
             no_gaps=self._no_gaps,
             forward_only=self._forward_only,
             allow_destructive_models=t.cast(t.Set, self._allow_destructive_models),
@@ -278,7 +265,6 @@ class PlanBuilder:
             environment_naming_info=self.environment_naming_info,
             directly_modified=directly_modified,
             indirectly_modified=indirectly_modified,
-            ignored=ignored,
             deployability_index=deployability_index,
             restatements=restatements,
             interval_end_per_model=interval_end_per_model,
@@ -297,30 +283,6 @@ class PlanBuilder:
         for s_id, context_snapshot in self._context_diff.snapshots.items():
             dag.add(s_id, context_snapshot.parents)
         return dag
-
-    def _build_filtered_dag(
-        self, full_dag: DAG[SnapshotId], deployability_index: DeployabilityIndex
-    ) -> t.Tuple[DAG[SnapshotId], t.Set[SnapshotId]]:
-        ignored_snapshot_ids: t.Set[SnapshotId] = set()
-        filtered_dag: DAG[SnapshotId] = DAG()
-        cache: t.Optional[t.Dict[str, datetime]] = {}
-        for s_id in full_dag:
-            snapshot = self._context_diff.snapshots.get(s_id)
-            # If the snapshot doesn't exist then it must be an external model
-            if not snapshot:
-                continue
-
-            is_deployable = deployability_index.is_deployable(s_id)
-            is_valid_start = snapshot.is_valid_start(
-                self._start, start_date(snapshot, self._context_diff.snapshots.values(), cache)
-            )
-            if set(snapshot.parents).isdisjoint(ignored_snapshot_ids) and (
-                not is_deployable or is_valid_start
-            ):
-                filtered_dag.add(s_id, snapshot.parents)
-            else:
-                ignored_snapshot_ids.add(s_id)
-        return filtered_dag, ignored_snapshot_ids
 
     def _build_restatements(
         self, dag: DAG[SnapshotId], earliest_interval_start: TimeLike
@@ -370,7 +332,9 @@ class PlanBuilder:
                 if not self._is_dev and snapshot.disable_restatement:
                     # This is a warning but we print this as error since the Console is lacking API for warnings.
                     self._console.log_error(
-                        f"Cannot restate model '{model_fqn}'. Restatement is disabled for this model."
+                        f"Cannot restate model '{model_fqn}'. "
+                        "Restatement is disabled for this model to prevent possible data loss."
+                        "If you want to restate this model, change the model's `disable_restatement` setting to `false`."
                     )
                     continue
                 elif snapshot.is_symbolic or snapshot.is_seed:
@@ -381,6 +345,7 @@ class PlanBuilder:
             for downstream_s_id in dag.downstream(snapshot.snapshot_id):
                 if is_restateable_snapshot(self._context_diff.snapshots[downstream_s_id]):
                     restatements[downstream_s_id] = dummy_interval
+
         # Get restatement intervals for all restated snapshots and make sure that if a snapshot expands it's
         # restatement range that it's downstream dependencies all expand their restatement ranges as well.
         for s_id in dag:
@@ -402,7 +367,20 @@ class PlanBuilder:
             ] + [interval]
             snapshot_start = min(i[0] for i in possible_intervals)
             snapshot_end = max(i[1] for i in possible_intervals)
+
+            # We may be tasked with restating a time range smaller than the target snapshot interval unit
+            # For example, restating an hour of Hourly Model A, which has a downstream dependency of Daily Model B
+            # we need to ensure the whole affected day in Model B is restated
+            floored_snapshot_start = snapshot.node.interval_unit.cron_floor(snapshot_start)
+            floored_snapshot_end = snapshot.node.interval_unit.cron_floor(snapshot_end)
+            if to_timestamp(floored_snapshot_end) < snapshot_end:
+                snapshot_start = to_timestamp(floored_snapshot_start)
+                snapshot_end = to_timestamp(
+                    snapshot.node.interval_unit.cron_next(floored_snapshot_end)
+                )
+
             restatements[s_id] = (snapshot_start, snapshot_end)
+
         return restatements
 
     def _build_directly_and_indirectly_modified(
@@ -437,19 +415,25 @@ class PlanBuilder:
             indirectly_modified,
         )
 
-    def _build_models_to_backfill(self, dag: DAG[SnapshotId]) -> t.Optional[t.Set[str]]:
-        if self._backfill_models is None:
+    def _build_models_to_backfill(
+        self, dag: DAG[SnapshotId], restatements: t.Collection[SnapshotId]
+    ) -> t.Optional[t.Set[str]]:
+        backfill_models = (
+            self._backfill_models
+            if self._backfill_models is not None
+            else [r.name for r in restatements]
+            # Only backfill models explicitly marked for restatement.
+            if self._restate_models
+            else None
+        )
+        if backfill_models is None:
             return None
-        if not self._is_dev:
-            raise PlanError(
-                "Selecting models to backfill is only supported for development environments."
-            )
         return {
             self._context_diff.snapshots[s_id].name
             for s_id in dag.subdag(
                 *[
                     self._model_fqn_to_snapshot[m].snapshot_id
-                    for m in self._backfill_models
+                    for m in backfill_models
                     if m in self._model_fqn_to_snapshot
                 ]
             ).sorted
@@ -498,12 +482,21 @@ class PlanBuilder:
                 )
 
                 if has_drop_alteration(schema_diff):
-                    warning_msg = f"Plan results in a destructive change to forward-only model '{snapshot.name}'s schema"
+                    dropped_column_names = get_dropped_column_names(schema_diff)
+                    dropped_column_str = (
+                        "', '".join(dropped_column_names) if dropped_column_names else None
+                    )
+                    dropped_column_msg = (
+                        f" that drops column{'s' if dropped_column_names and len(dropped_column_names) > 1 else ''} '{dropped_column_str}'"
+                        if dropped_column_str
+                        else ""
+                    )
+                    warning_msg = f"Plan results in a destructive change to forward-only model '{snapshot.name}'s schema{dropped_column_msg}."
                     if snapshot.model.on_destructive_change.is_warn:
-                        logger.warning(warning_msg)
+                        get_console().log_warning(warning_msg)
                     else:
                         raise PlanError(
-                            f"{warning_msg}. To allow this, change the model's `on_destructive_change` setting to `warn` or `allow` or include it in the plan's `--allow-destructive-model` option."
+                            f"{warning_msg} To allow this, change the model's `on_destructive_change` setting to `warn` or `allow` or include it in the plan's `--allow-destructive-model` option."
                         )
 
     def _categorize_snapshots(
@@ -610,7 +603,7 @@ class PlanBuilder:
             if (
                 snapshot.evaluatable
                 and not snapshot.disable_restatement
-                and not snapshot.full_history_restatement_only
+                and (not snapshot.full_history_restatement_only or not snapshot.is_incremental)
             ):
                 snapshot.effective_from = self._effective_from
 
@@ -686,7 +679,7 @@ class PlanBuilder:
             and not self._backfill_models
         ):
             raise NoChangesPlanError(
-                "No changes were detected. Make a change or run with --include-unmodified to create a new environment without changes."
+                f"Creating a new environment requires a change, but project files match the `{self._context_diff.create_from}` environment. Make a change or use the --include-unmodified flag to create a new environment without changes."
             )
 
     @cached_property
@@ -698,8 +691,25 @@ class PlanBuilder:
                 self._enable_preview
                 and any(
                     snapshot.model.forward_only
-                    for snapshot, _ in self._context_diff.modified_snapshots.values()
+                    for snapshot in self._modified_and_added_snapshots
                     if snapshot.is_model
                 )
             )
         )
+
+    @cached_property
+    def _auto_restatement_preview_needed(self) -> bool:
+        return self._is_dev and any(
+            snapshot.model.auto_restatement_cron is not None
+            for snapshot in self._modified_and_added_snapshots
+            if snapshot.is_model
+        )
+
+    @cached_property
+    def _modified_and_added_snapshots(self) -> t.List[Snapshot]:
+        return [
+            snapshot
+            for snapshot in self._context_diff.snapshots.values()
+            if snapshot.name in self._context_diff.modified_snapshots
+            or snapshot.snapshot_id in self._context_diff.added
+        ]

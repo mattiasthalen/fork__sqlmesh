@@ -14,11 +14,10 @@ from typing import List
 
 import requests
 from hyperscript import Element, h
-from rich.console import Console
 from sqlglot.helper import seq_get
 
 from sqlmesh.core import constants as c
-from sqlmesh.core.console import SNAPSHOT_CHANGE_CATEGORY_STR, MarkdownConsole
+from sqlmesh.core.console import SNAPSHOT_CHANGE_CATEGORY_STR, get_console, MarkdownConsole
 from sqlmesh.core.context import Context
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.plan import Plan, PlanBuilder
@@ -303,7 +302,11 @@ class GithubController:
         self._prod_plan_builder: t.Optional[PlanBuilder] = None
         self._prod_plan_with_gaps_builder: t.Optional[PlanBuilder] = None
         self._check_run_mapping: t.Dict[str, CheckRun] = {}
-        self._console = MarkdownConsole(console=Console(no_color=True))
+
+        if not isinstance(get_console(), MarkdownConsole):
+            raise CICDBotError("Console must be a markdown console.")
+        self._console = t.cast(MarkdownConsole, get_console())
+
         self._client: Github = client or Github(
             base_url=os.environ["GITHUB_API_URL"],
             login_or_token=self._token,
@@ -326,7 +329,6 @@ class GithubController:
         self._context: Context = Context(
             paths=self._paths,
             config=self.config,
-            console=self._console,
         )
 
     @property
@@ -460,7 +462,6 @@ class GithubController:
                 environment_naming_info=plan.environment_naming_info,
                 default_catalog=self._context.default_catalog,
                 no_diff=False,
-                ignored_snapshot_ids=plan.ignored,
             )
             difference_summary = self._console.consume_captured_output()
             self._console._show_missing_dates(plan, self._context.default_catalog)
@@ -673,7 +674,9 @@ class GithubController:
                 # Clear out console
                 self._console.consume_captured_output()
                 self._console.log_test_results(
-                    result, output, self._context._test_connection_config._engine_adapter.DIALECT
+                    result,
+                    output,
+                    self._context._test_connection_config._engine_adapter.DIALECT,
                 )
                 test_summary = self._console.consume_captured_output()
                 test_title = "Tests Passed" if result.wasSuccessful() else "Tests Failed"

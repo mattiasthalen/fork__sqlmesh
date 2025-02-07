@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import ast
 import json
 import logging
-import sys
 import types
 import re
 import typing as t
@@ -12,58 +10,55 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
-from astor import to_source
 from pydantic import Field
 from sqlglot import diff, exp
 from sqlglot.diff import Insert
-from sqlglot.helper import ensure_list
+from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.optimizer.simplify import gen
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.schema import MappingSchema, nested_set
 from sqlglot.time import format_time
 
-from sqlmesh.core.dialect import extract_audit
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
-from sqlmesh.core.macros import MacroRegistry, MacroStrTemplate, macro
-from sqlmesh.core.model.common import expression_validator
+from sqlmesh.core.audit import Audit, ModelAudit
+from sqlmesh.core.node import IntervalUnit
+from sqlmesh.core.macros import MacroRegistry, macro
+from sqlmesh.core.model.common import (
+    expression_validator,
+    make_python_env,
+    parse_dependencies,
+    single_value_or_tuple,
+)
+from sqlmesh.core.model.meta import ModelMeta, FunctionCall
 from sqlmesh.core.model.kind import ModelKindName, SeedKind, ModelKind, FullKind, create_model_kind
-from sqlmesh.core.model.meta import ModelMeta, AuditReference
 from sqlmesh.core.model.seed import CsvSeedReader, Seed, create_seed
 from sqlmesh.core.renderer import ExpressionRenderer, QueryRenderer
+from sqlmesh.core.signal import SignalRegistry
 from sqlmesh.utils import columns_to_types_all_known, str_to_bool, UniqueKeyDict
+from sqlmesh.utils.cron import CroniterCache
 from sqlmesh.utils.date import TimeLike, make_inclusive, to_datetime, to_time_column
-from sqlmesh.utils.errors import ConfigError, SQLMeshError, raise_config_error
+from sqlmesh.utils.errors import ConfigError, SQLMeshError, raise_config_error, PythonModelEvalError
 from sqlmesh.utils.hashing import hash_data
 from sqlmesh.utils.jinja import JinjaMacroRegistry, extract_macro_references_and_variables
-from sqlmesh.utils.pydantic import PRIVATE_FIELDS, field_validator, field_validator_v1_args
+from sqlmesh.utils.pydantic import PydanticModel, PRIVATE_FIELDS
 from sqlmesh.utils.metaprogramming import (
     Executable,
     build_env,
     prepare_env,
-    print_exception,
     serialize_env,
+    format_evaluated_code_exception,
 )
 
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
-    from sqlmesh.core._typing import TableName
-    from sqlmesh.core.audit import ModelAudit, Audit
+    from sqlmesh.core._typing import Self, TableName
     from sqlmesh.core.context import ExecutionContext
     from sqlmesh.core.engine_adapter import EngineAdapter
     from sqlmesh.core.engine_adapter._typing import QueryOrDF
     from sqlmesh.core.snapshot import DeployabilityIndex, Node, Snapshot
     from sqlmesh.utils.jinja import MacroReference
 
-    if sys.version_info >= (3, 11):
-        from typing import Self
-    else:
-        from typing_extensions import Self
-
-if sys.version_info >= (3, 9):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +108,18 @@ class _Model(ModelMeta, frozen=True):
         storage_format: The storage format used to store the physical table, only applicable in certain engines.
             (eg. 'parquet', 'orc')
         partitioned_by: The partition columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
-        clustered_by: The cluster columns, only applicable in certain engines. (eg. (ds, hour))
+        clustered_by: The cluster columns or engine specific expressions, only applicable in certain engines. (eg. (ds, hour))
         python_env: Dictionary containing all global variables needed to render the model's macros.
         mapping_schema: The schema of table names to column and types.
+        extract_dependencies_from_query: Whether to extract additional dependencies from the rendered model's query.
         physical_schema_override: The desired physical schema name override.
     """
 
-    python_env_: t.Optional[t.Dict[str, Executable]] = Field(default=None, alias="python_env")
+    python_env: t.Dict[str, Executable] = {}
     jinja_macros: JinjaMacroRegistry = JinjaMacroRegistry()
+    audit_definitions: t.Dict[str, ModelAudit] = {}
     mapping_schema: t.Dict[str, t.Any] = {}
+    extract_dependencies_from_query: bool = True
 
     _full_depends_on: t.Optional[t.Set[str]] = None
     _statement_renderer_cache: t.Dict[int, ExpressionRenderer] = {}
@@ -131,6 +129,9 @@ class _Model(ModelMeta, frozen=True):
     )
     post_statements_: t.Optional[t.List[exp.Expression]] = Field(
         default=None, alias="post_statements"
+    )
+    on_virtual_update_: t.Optional[t.List[exp.Expression]] = Field(
+        default=None, alias="on_virtual_update"
     )
 
     _expressions_validator = expression_validator
@@ -181,7 +182,10 @@ class _Model(ModelMeta, frozen=True):
         )
 
     def render_definition(
-        self, include_python: bool = True, include_defaults: bool = False
+        self,
+        include_python: bool = True,
+        include_defaults: bool = False,
+        render_query: bool = False,
     ) -> t.List[exp.Expression]:
         """Returns the original list of sql expressions comprising the model definition.
 
@@ -215,6 +219,8 @@ class _Model(ModelMeta, frozen=True):
                     "default_catalog",
                     "enabled",
                     "inline_audits",
+                    "optimize_query",
+                    "validate_query",
                 ):
                     expressions.append(
                         exp.Property(
@@ -379,7 +385,7 @@ class _Model(ModelMeta, frozen=True):
         start: t.Optional[TimeLike] = None,
         end: t.Optional[TimeLike] = None,
         execution_time: t.Optional[TimeLike] = None,
-        snapshots: t.Optional[t.Collection[Snapshot]] = None,
+        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
         expand: t.Iterable[str] = tuple(),
         deployability_index: t.Optional[DeployabilityIndex] = None,
         engine_adapter: t.Optional[EngineAdapter] = None,
@@ -415,6 +421,107 @@ class _Model(ModelMeta, frozen=True):
             **kwargs,
         )
 
+    def render_on_virtual_update(
+        self,
+        *,
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
+        expand: t.Iterable[str] = tuple(),
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        engine_adapter: t.Optional[EngineAdapter] = None,
+        **kwargs: t.Any,
+    ) -> t.List[exp.Expression]:
+        if "this_model" not in kwargs:
+            kwargs["this_model"] = self.fully_qualified_table
+        return self._render_statements(
+            self.on_virtual_update,
+            start=start,
+            end=end,
+            execution_time=execution_time,
+            snapshots=snapshots,
+            expand=expand,
+            deployability_index=deployability_index,
+            engine_adapter=engine_adapter,
+            **kwargs,
+        )
+
+    def render_audit_query(
+        self,
+        audit: Audit,
+        *,
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+        snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
+        deployability_index: t.Optional[DeployabilityIndex] = None,
+        **kwargs: t.Any,
+    ) -> exp.Query:
+        from sqlmesh.core.snapshot import DeployabilityIndex
+
+        deployability_index = deployability_index or DeployabilityIndex.all_deployable()
+        snapshot = (snapshots or {}).get(self.fqn)
+
+        this_model = kwargs.pop("this_model", None) or (
+            snapshot.table_name(deployability_index.is_deployable(snapshot))
+            if snapshot
+            else self.fqn
+        )
+
+        columns_to_types: t.Optional[t.Dict[str, t.Any]] = None
+        if "engine_adapter" in kwargs:
+            try:
+                columns_to_types = kwargs["engine_adapter"].columns(this_model)
+            except Exception:
+                pass
+
+        if self.time_column:
+            where = self.time_column.column.between(
+                self.convert_to_time_column(start or c.EPOCH, columns_to_types),
+                self.convert_to_time_column(end or c.EPOCH, columns_to_types),
+            )
+        else:
+            where = None
+
+        # The model's name is already normalized, but in case of snapshots we also prepend a
+        # case-sensitive physical schema name, so we quote here to ensure that we won't have
+        # a broken schema reference after the resulting query is normalized in `render`.
+        quoted_model_name = quote_identifiers(
+            exp.to_table(this_model, dialect=self.dialect), dialect=self.dialect
+        )
+
+        query_renderer = QueryRenderer(
+            audit.query,
+            audit.dialect or self.dialect,
+            audit.macro_definitions,
+            path=audit._path or Path(),
+            jinja_macro_registry=audit.jinja_macros,
+            python_env=self.python_env,
+            only_execution_time=self.kind.only_execution_time,
+            default_catalog=self.default_catalog,
+        )
+
+        rendered_query = query_renderer.render(
+            start=start,
+            end=end,
+            execution_time=execution_time,
+            snapshots=snapshots,
+            deployability_index=deployability_index,
+            **{
+                **audit.defaults,
+                "this_model": exp.select("*").from_(quoted_model_name).where(where).subquery(),
+                **kwargs,
+            },  # type: ignore
+        )
+
+        if rendered_query is None:
+            raise SQLMeshError(
+                f"Failed to render query for audit '{audit.name}', model '{self.name}'."
+            )
+
+        return rendered_query
+
     @property
     def pre_statements(self) -> t.List[exp.Expression]:
         return self.pre_statements_ or []
@@ -424,9 +531,17 @@ class _Model(ModelMeta, frozen=True):
         return self.post_statements_ or []
 
     @property
+    def on_virtual_update(self) -> t.List[exp.Expression]:
+        return self.on_virtual_update_ or []
+
+    @property
     def macro_definitions(self) -> t.List[d.MacroDef]:
         """All macro definitions from the list of expressions."""
-        return [s for s in self.pre_statements + self.post_statements if isinstance(s, d.MacroDef)]
+        return [
+            s
+            for s in self.pre_statements + self.post_statements + self.on_virtual_update
+            if isinstance(s, d.MacroDef)
+        ]
 
     def _render_statements(
         self,
@@ -474,20 +589,9 @@ class _Model(ModelMeta, frozen=True):
             The list of rendered expressions.
         """
 
-        def _create_renderer(expression: exp.Expression) -> ExpressionRenderer:
-            return ExpressionRenderer(
-                expression,
-                self.dialect,
-                [],
-                path=self._path,
-                jinja_macro_registry=self.jinja_macros,
-                python_env=self.python_env,
-                only_execution_time=False,
-            )
-
         def _render(e: exp.Expression) -> str | int | float | bool:
             rendered_exprs = (
-                _create_renderer(e).render(start=start, end=end, execution_time=execution_time)
+                self._create_renderer(e).render(start=start, end=end, execution_time=execution_time)
                 or []
             )
             if len(rendered_exprs) != 1:
@@ -502,7 +606,41 @@ class _Model(ModelMeta, frozen=True):
                 return rendered.this
             return rendered.sql(dialect=self.dialect)
 
-        return [{t.this.name: _render(t.expression) for t in signal} for signal in self.signals]
+        # airflow only
+        return [
+            {k: _render(v) for k, v in signal.items()} for name, signal in self.signals if not name
+        ]
+
+    def render_merge_filter(
+        self,
+        *,
+        start: t.Optional[TimeLike] = None,
+        end: t.Optional[TimeLike] = None,
+        execution_time: t.Optional[TimeLike] = None,
+    ) -> t.Optional[exp.Expression]:
+        if self.merge_filter is None:
+            return None
+        rendered_exprs = (
+            self._create_renderer(self.merge_filter).render(
+                start=start, end=end, execution_time=execution_time
+            )
+            or []
+        )
+        if len(rendered_exprs) != 1:
+            raise SQLMeshError(f"Expected one expression but got {len(rendered_exprs)}")
+        return rendered_exprs[0].transform(d.replace_merge_table_aliases)
+
+    def _create_renderer(self, expression: exp.Expression) -> ExpressionRenderer:
+        return ExpressionRenderer(
+            expression,
+            self.dialect,
+            [],
+            path=self._path,
+            jinja_macro_registry=self.jinja_macros,
+            python_env=self.python_env,
+            only_execution_time=False,
+            quote_identifiers=False,
+        )
 
     def ctas_query(self, **render_kwarg: t.Any) -> exp.Query:
         """Return a dummy query to do a CTAS.
@@ -534,49 +672,12 @@ class _Model(ModelMeta, frozen=True):
             )
         return query
 
-    def referenced_audits(
-        self,
-        audits: t.Dict[str, ModelAudit],
-        default_audits: t.List[AuditReference] = [],
-    ) -> t.List[ModelAudit]:
-        """Returns audits referenced in this model.
-
-        Args:
-            audits: Available audits by name.
-        """
-        from sqlmesh.core.audit import BUILT_IN_AUDITS
-
-        referenced_audits = []
-
-        for audit_name, audit_args in self.audits + default_audits:
-            if audit_name in self.inline_audits:
-                referenced_audits.append(self.inline_audits[audit_name])
-            elif audit_name in audits:
-                referenced_audits.append(audits[audit_name])
-            else:
-                audit = BUILT_IN_AUDITS.get(audit_name)
-                if not audit:
-                    raise_config_error(
-                        f"Unknown audit '{audit_name}' referenced in model '{self.name}'",
-                        self._path,
-                    )
-
-                # Builtin audits are generally not included in order to reduce fingerprint size,
-                # but those that override `blocking` need to be included because otherwise doing
-                # `audit.blocking` will always return the builtin audit's default value
-                blocking = audit_args.get("blocking")
-                if blocking:
-                    referenced_audits.append(
-                        audit.copy(update={"blocking": blocking == exp.true()})  # type: ignore
-                    )
-
-        return referenced_audits
-
-    def text_diff(self, other: Node) -> str:
+    def text_diff(self, other: Node, rendered: bool = False) -> str:
         """Produce a text diff against another node.
 
         Args:
             other: The node to diff against.
+            rendered: Whether the diff should compare raw vs rendered models
 
         Returns:
             A unified text diff showing additions and deletions.
@@ -586,9 +687,22 @@ class _Model(ModelMeta, frozen=True):
                 f"Cannot diff model '{self.name} against a non-model node '{other.name}'"
             )
 
-        return d.text_diff(
-            self.render_definition(), other.render_definition(), self.dialect, other.dialect
+        text_diff = d.text_diff(
+            self.render_definition(render_query=rendered),
+            other.render_definition(render_query=rendered),
+            self.dialect,
+            other.dialect,
         ).strip()
+
+        if not text_diff and not rendered:
+            text_diff = d.text_diff(
+                self.render_definition(render_query=True),
+                other.render_definition(render_query=True),
+                self.dialect,
+                other.dialect,
+            ).strip()
+
+        return text_diff
 
     def set_time_format(self, default_time_format: str = c.DEFAULT_TIME_COLUMN_FORMAT) -> None:
         """Sets the default time format for a model.
@@ -625,7 +739,12 @@ class _Model(ModelMeta, frozen=True):
 
             time_column_type = columns_to_types[self.time_column.column.name]
 
-            return to_time_column(time, time_column_type, self.time_column.format)
+            return to_time_column(
+                time,
+                time_column_type,
+                self.dialect,
+                self.time_column.format,
+            )
         return exp.convert(time)
 
     def set_mapping_schema(self, schema: t.Dict) -> None:
@@ -691,10 +810,6 @@ class _Model(ModelMeta, frozen=True):
         return self.fully_qualified_table.name
 
     @property
-    def python_env(self) -> t.Dict[str, Executable]:
-        return self.python_env_ or {}
-
-    @property
     def schema_name(self) -> str:
         return self.fully_qualified_table.db or c.DEFAULT_SCHEMA
 
@@ -727,12 +842,22 @@ class _Model(ModelMeta, frozen=True):
         return getattr(self.kind, "disable_restatement", False)
 
     @property
-    def wap_supported(self) -> bool:
-        return self.kind.is_materialized and (self.storage_format or "").lower() == "iceberg"
+    def auto_restatement_intervals(self) -> t.Optional[int]:
+        return getattr(self.kind, "auto_restatement_intervals", None)
 
     @property
-    def inline_audits(self) -> t.Dict[str, ModelAudit]:
-        return {}
+    def auto_restatement_cron(self) -> t.Optional[str]:
+        return getattr(self.kind, "auto_restatement_cron", None)
+
+    def auto_restatement_croniter(self, value: TimeLike) -> CroniterCache:
+        cron = self.auto_restatement_cron
+        if cron is None:
+            raise SQLMeshError("Auto restatement cron is not set.")
+        return CroniterCache(cron, value)
+
+    @property
+    def wap_supported(self) -> bool:
+        return self.kind.is_materialized and (self.storage_format or "").lower() == "iceberg"
 
     def validate_definition(self) -> None:
         """Validates the model's definition.
@@ -757,7 +882,7 @@ class _Model(ModelMeta, frozen=True):
 
                 if len(values) != len(unique_keys):
                     raise_config_error(
-                        "All keys in '{field}' must be unique in the model definition",
+                        f"All keys in '{field}' must be unique in the model definition",
                         self._path,
                     )
 
@@ -791,7 +916,28 @@ class _Model(ModelMeta, frozen=True):
             # TODO: would this sort of logic be better off moved into the Kind?
             if self.dialect == "snowflake" and "target_lag" not in self.physical_properties:
                 raise_config_error(
-                    "Snowflake managed tables must specify the 'target_lag' physical property"
+                    "Snowflake managed tables must specify the 'target_lag' physical property",
+                    self._path,
+                )
+
+        if self.physical_version is not None and not self.forward_only:
+            raise_config_error(
+                "Pinning a physical version is only supported for forward only models",
+                self._path,
+            )
+
+        # The following attributes should be set only for SQL models
+        if not self.is_sql:
+            if self.optimize_query:
+                raise_config_error(
+                    "SQLMesh query optimizer can only be enabled for SQL models",
+                    self._path,
+                )
+
+            if self.validate_query:
+                raise_config_error(
+                    "Query validation can only be enabled for SQL models",
+                    self._path,
                 )
 
     def is_breaking_change(self, previous: Model) -> t.Optional[bool]:
@@ -829,10 +975,13 @@ class _Model(ModelMeta, frozen=True):
             self.storage_format,
             str(self.lookback),
             *(gen(expr) for expr in (self.partitioned_by or [])),
-            *(self.clustered_by or []),
+            *(gen(expr) for expr in (self.clustered_by or [])),
             self.stamp,
             self.physical_schema,
+            self.physical_version,
+            self.gateway,
             self.interval_unit.value if self.interval_unit is not None else None,
+            str(self.optimize_query) if self.optimize_query is not None else None,
         ]
 
         for column_name, column_type in (self.columns_to_types_ or {}).items():
@@ -857,19 +1006,17 @@ class _Model(ModelMeta, frozen=True):
 
         return data  # type: ignore
 
-    def metadata_hash(self, audits: t.Dict[str, ModelAudit]) -> str:
+    @property
+    def metadata_hash(self) -> str:
         """
         Computes the metadata hash for the node.
-
-        Args:
-            audits: Available audits by name.
 
         Returns:
             The metadata hash for the node.
         """
-        from sqlmesh.core.audit import BUILT_IN_AUDITS
-
         if self._metadata_hash is None:
+            from sqlmesh.core.audit.builtin import BUILT_IN_AUDITS
+
             metadata = [
                 self.dialect,
                 self.owner,
@@ -888,25 +1035,19 @@ class _Model(ModelMeta, frozen=True):
                 self.project,
                 str(self.allow_partials),
                 gen(self.session_properties_) if self.session_properties_ else None,
+                str(self.validate_query) if self.validate_query is not None else None,
             ]
 
             for audit_name, audit_args in sorted(self.audits, key=lambda a: a[0]):
                 metadata.append(audit_name)
-                audit = None
                 if audit_name in BUILT_IN_AUDITS:
                     for arg_name, arg_value in audit_args.items():
                         metadata.append(arg_name)
                         metadata.append(gen(arg_value))
-                elif audit_name in self.inline_audits:
-                    audit = self.inline_audits[audit_name]
-                elif audit_name in audits:
-                    audit = audits[audit_name]
                 else:
-                    raise SQLMeshError(f"Unexpected audit name '{audit_name}'.")
-
-                if audit:
+                    audit = self.audit_definitions[audit_name]
                     query = (
-                        audit.render_query(self, **t.cast(t.Dict[str, t.Any], audit_args))
+                        self.render_audit_query(audit, **t.cast(t.Dict[str, t.Any], audit_args))
                         or audit.query
                     )
                     metadata.extend(
@@ -922,7 +1063,11 @@ class _Model(ModelMeta, frozen=True):
                 metadata.append(key)
                 metadata.append(gen(value))
 
-            metadata.extend(gen(s) for s in self.signals)
+            for signal_name, args in sorted(self.signals, key=lambda x: x[0]):
+                metadata.append(signal_name)
+                for k, v in sorted(args.items()):
+                    metadata.append(f"{k}:{gen(v)}")
+
             metadata.extend(self._additional_metadata)
 
             self._metadata_hash = hash_data(metadata)
@@ -945,6 +1090,9 @@ class _Model(ModelMeta, frozen=True):
             if self._is_metadata_statement(statement):
                 additional_metadata.append(gen(statement))
 
+        for statement in self.on_virtual_update:
+            additional_metadata.append(gen(statement))
+
         return additional_metadata
 
     def _is_metadata_statement(self, statement: exp.Expression) -> bool:
@@ -961,6 +1109,8 @@ class _Model(ModelMeta, frozen=True):
 
     @property
     def full_depends_on(self) -> t.Set[str]:
+        if not self.extract_dependencies_from_query:
+            return self.depends_on_ or set()
         if self._full_depends_on is None:
             depends_on = self.depends_on_ or set()
 
@@ -973,46 +1123,63 @@ class _Model(ModelMeta, frozen=True):
 
         return self._full_depends_on
 
-
-class _SqlBasedModel(_Model):
-    inline_audits_: t.Dict[str, t.Any] = Field(default={}, alias="inline_audits")
-
-    _expression_validator = expression_validator
-
-    @field_validator("inline_audits_", mode="before")
-    @field_validator_v1_args
-    def _inline_audits_validator(cls, v: t.Any, values: t.Dict[str, t.Any]) -> t.Any:
-        if not isinstance(v, dict):
-            return {}
-
-        from sqlmesh.core.audit import ModelAudit
-
-        inline_audits = {}
-
-        for name, audit in v.items():
-            if isinstance(audit, ModelAudit):
-                inline_audits[name] = audit
-            elif isinstance(audit, dict):
-                inline_audits[name] = ModelAudit.parse_obj(audit)
-
-        return inline_audits
+    @property
+    def partitioned_by(self) -> t.List[exp.Expression]:
+        """Columns to partition the model by, including the time column if it is not already included."""
+        if self.time_column and not self._is_time_column_in_partitioned_by:
+            return [
+                TIME_COL_PARTITION_FUNC.get(self.dialect, lambda x, y: x)(
+                    self.time_column.column, self.columns_to_types
+                ),
+                *self.partitioned_by_,
+            ]
+        return self.partitioned_by_
 
     @property
-    def inline_audits(self) -> t.Dict[str, ModelAudit]:
-        return self.inline_audits_
+    def partition_interval_unit(self) -> t.Optional[IntervalUnit]:
+        """The interval unit to use for partitioning if applicable."""
+        # Only return the interval unit for partitioning if the partitioning
+        # wasn't explicitly set by the user. Otherwise, the user-provided
+        # value should always take precedence.
+        if self.time_column and not self._is_time_column_in_partitioned_by:
+            return self.interval_unit
+        return None
+
+    @property
+    def audits_with_args(self) -> t.List[t.Tuple[Audit, t.Dict[str, exp.Expression]]]:
+        from sqlmesh.core.audit.builtin import BUILT_IN_AUDITS
+
+        audits_by_name = {**BUILT_IN_AUDITS, **self.audit_definitions}
+        audits_with_args = {}
+
+        for audit_name, audit_args in self.audits:
+            audits_with_args[audit_name] = (audits_by_name[audit_name], audit_args.copy())
+
+        for audit_name in self.audit_definitions:
+            if audit_name not in audits_with_args:
+                audits_with_args[audit_name] = (audits_by_name[audit_name], {})
+
+        return list(audits_with_args.values())
+
+    @property
+    def _is_time_column_in_partitioned_by(self) -> bool:
+        return self.time_column is not None and self.time_column.column in {
+            col for expr in self.partitioned_by_ for col in expr.find_all(exp.Column)
+        }
 
 
-class SqlModel(_SqlBasedModel):
+class SqlModel(_Model):
     """The model definition which relies on a SQL query to fetch the data.
 
     Args:
         query: The main query representing the model.
         pre_statements: The list of SQL statements that precede the model's query.
         post_statements: The list of SQL statements that follow after the model's query.
+        on_virtual_update: The list of SQL statements to be executed after the virtual update.
     """
 
     query: t.Union[exp.Query, d.JinjaQuery, d.MacroFunc]
-    source_type: Literal["sql"] = "sql"
+    source_type: t.Literal["sql"] = "sql"
 
     _columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None
 
@@ -1062,14 +1229,26 @@ class SqlModel(_SqlBasedModel):
         return query
 
     def render_definition(
-        self, include_python: bool = True, include_defaults: bool = False
+        self,
+        include_python: bool = True,
+        include_defaults: bool = False,
+        render_query: bool = False,
     ) -> t.List[exp.Expression]:
         result = super().render_definition(
             include_python=include_python, include_defaults=include_defaults
         )
-        result.extend(self.pre_statements)
-        result.append(self.query)
-        result.extend(self.post_statements)
+
+        if render_query:
+            result.extend(self.render_pre_statements())
+            result.append(self.render_query() or self.query)
+            result.extend(self.render_post_statements())
+            result.extend(self.render_on_virtual_update())
+        else:
+            result.extend(self.pre_statements)
+            result.append(self.query)
+            result.extend(self.post_statements)
+            result.extend(self.on_virtual_update)
+
         return result
 
     @property
@@ -1086,8 +1265,12 @@ class SqlModel(_SqlBasedModel):
             if query is None:
                 return None
 
+            unknown = exp.DataType.build("unknown")
+
             self._columns_to_types = {
-                select.output_name: select.type or exp.DataType.build("unknown")
+                # copy data type because it is used in the engine to build CTAS and other queries
+                # this can change the parent which will mess up the diffing algo
+                select.output_name: (select.type or unknown).copy()
                 for select in query.selects
             }
 
@@ -1147,7 +1330,7 @@ class SqlModel(_SqlBasedModel):
                 continue
             if not alias:
                 raise_config_error(
-                    f"Outer projection '{expression}' must have inferrable names or explicit aliases.",
+                    f"Outer projection '{expression.sql(dialect=self.dialect)}' must have inferrable names or explicit aliases.",
                     self._path,
                 )
             name_counts[alias] = name_counts.get(alias, 0) + 1
@@ -1182,9 +1365,16 @@ class SqlModel(_SqlBasedModel):
             # Can't determine if there's a breaking change if we can't render the query.
             return None
 
-        edits = diff(
-            previous_query, this_query, matchings=[(previous_query, this_query)], delta_only=True
-        )
+        if previous_query is this_query:
+            edits = []
+        else:
+            edits = diff(
+                previous_query,
+                this_query,
+                matchings=[(previous_query, this_query)],
+                delta_only=True,
+                copy=False,
+            )
         inserted_expressions = {e.expression for e in edits if isinstance(e, Insert)}
 
         for edit in edits:
@@ -1192,7 +1382,7 @@ class SqlModel(_SqlBasedModel):
                 return None
 
             expr = edit.expression
-            if _is_udtf(expr):
+            if isinstance(expr, exp.UDTF):
                 # projection subqueries do not change cardinality, engines don't allow these to return
                 # more than one row of data
                 parent = expr.find_ancestor(exp.Subquery)
@@ -1222,6 +1412,8 @@ class SqlModel(_SqlBasedModel):
             only_execution_time=self.kind.only_execution_time,
             default_catalog=self.default_catalog,
             quote_identifiers=not no_quote_identifiers,
+            optimize_query=self.optimize_query,
+            validate_query=self.validate_query,
         )
 
     @property
@@ -1233,8 +1425,12 @@ class SqlModel(_SqlBasedModel):
         data.extend(self.jinja_macros.data_hash_values)
         return data
 
+    @property
+    def _additional_metadata(self) -> t.List[str]:
+        return [*super()._additional_metadata, gen(self.query)]
 
-class SeedModel(_SqlBasedModel):
+
+class SeedModel(_Model):
     """The model definition which uses a pre-built static dataset to source the data from.
 
     Args:
@@ -1246,7 +1442,7 @@ class SeedModel(_SqlBasedModel):
     column_hashes_: t.Optional[t.Dict[str, str]] = Field(default=None, alias="column_hashes")
     derived_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None
     is_hydrated: bool = True
-    source_type: Literal["seed"] = "seed"
+    source_type: t.Literal["seed"] = "seed"
 
     def __getstate__(self) -> t.Dict[t.Any, t.Any]:
         state = super().__getstate__()
@@ -1444,7 +1640,7 @@ class PythonModel(_Model):
 
     kind: ModelKind = FullKind()
     entrypoint: str
-    source_type: Literal["python"] = "python"
+    source_type: t.Literal["python"] = "python"
 
     def validate_definition(self) -> None:
         super().validate_definition()
@@ -1464,7 +1660,7 @@ class PythonModel(_Model):
         **kwargs: t.Any,
     ) -> t.Iterator[QueryOrDF]:
         env = prepare_env(self.python_env)
-        start, end = make_inclusive(start or c.EPOCH, end or c.EPOCH)
+        start, end = make_inclusive(start or c.EPOCH, end or c.EPOCH, self.dialect)
         execution_time = to_datetime(execution_time or c.EPOCH)
 
         variables = env.get(c.SQLMESH_VARS, {})
@@ -1490,15 +1686,19 @@ class PythonModel(_Model):
             for df in df_or_iter:
                 yield df
         except Exception as e:
-            print_exception(e, self.python_env)
-            raise SQLMeshError(f"Error executing Python model '{self.name}'")
+            raise PythonModelEvalError(format_evaluated_code_exception(e, self.python_env))
 
     def render_definition(
-        self, include_python: bool = True, include_defaults: bool = False
+        self,
+        include_python: bool = True,
+        include_defaults: bool = False,
+        render_query: bool = False,
     ) -> t.List[exp.Expression]:
         # Ignore the provided value for the include_python flag, since the Pyhon model's
         # definition without Python code is meaningless.
-        return super().render_definition(include_python=True, include_defaults=include_defaults)
+        return super().render_definition(
+            include_python=True, include_defaults=include_defaults, render_query=render_query
+        )
 
     @property
     def is_python(self) -> bool:
@@ -1517,8 +1717,7 @@ class PythonModel(_Model):
 class ExternalModel(_Model):
     """The model definition which represents an external source/table."""
 
-    source_type: Literal["external"] = "external"
-    gateway: t.Optional[str] = None
+    source_type: t.Literal["external"] = "external"
 
     def is_breaking_change(self, previous: Model) -> t.Optional[bool]:
         if not isinstance(previous, ExternalModel):
@@ -1539,6 +1738,20 @@ class ExternalModel(_Model):
 Model = t.Union[SqlModel, SeedModel, PythonModel, ExternalModel]
 
 
+class AuditResult(PydanticModel):
+    audit: Audit
+    """The audit this result is for."""
+    model: t.Optional[_Model] = None
+    """The model this audit is for."""
+    count: t.Optional[int] = None
+    """The number of records returned by the audit query. This could be None if the audit was skipped."""
+    query: t.Optional[exp.Expression] = None
+    """The rendered query used by the audit. This could be None if the audit was skipped."""
+    skipped: bool = False
+    """Whether or not the audit was blocking. This can be overriden by the user."""
+    blocking: bool = True
+
+
 def load_sql_based_model(
     expressions: t.List[exp.Expression],
     *,
@@ -1548,8 +1761,8 @@ def load_sql_based_model(
     time_column_format: str = c.DEFAULT_TIME_COLUMN_FORMAT,
     macros: t.Optional[MacroRegistry] = None,
     jinja_macros: t.Optional[JinjaMacroRegistry] = None,
-    audits: t.Optional[t.Dict[str, Audit]] = None,
-    default_audits: t.List[AuditReference] = [],
+    audits: t.Optional[t.Dict[str, ModelAudit]] = None,
+    default_audits: t.Optional[t.List[FunctionCall]] = None,
     python_env: t.Optional[t.Dict[str, Executable]] = None,
     dialect: t.Optional[str] = None,
     physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
@@ -1592,14 +1805,23 @@ def load_sql_based_model(
         meta = d.Model(expressions=[])  # Dummy meta node
         expressions.insert(0, meta)
 
+    unrendered_merge_filter = None
     unrendered_signals = None
-    model_audits = None
+    unrendered_audits = None
+
     for prop in meta.expressions:
         if prop.name.lower() == "signals":
             unrendered_signals = prop.args.get("value")
-
         if prop.name.lower() == "audits":
-            model_audits = prop.args.get("value")
+            unrendered_audits = prop.args.get("value")
+        if (
+            prop.name.lower() == "kind"
+            and (value := prop.args.get("value"))
+            and value.name.lower() == "incremental_by_unique_key"
+        ):
+            for kind_prop in value.expressions:
+                if kind_prop.name.lower() == "merge_filter":
+                    unrendered_merge_filter = kind_prop
 
     meta_renderer = _meta_renderer(
         expression=meta,
@@ -1623,7 +1845,7 @@ def load_sql_based_model(
     rendered_meta = rendered_meta_exprs[0]
 
     # Extract the query and any pre/post statements
-    query_or_seed_insert, pre_statements, post_statements, inline_audits = (
+    query_or_seed_insert, pre_statements, post_statements, on_virtual_update, inline_audits = (
         _split_sql_model_statements(expressions[1:], path, dialect=dialect)
     )
 
@@ -1637,9 +1859,18 @@ def load_sql_based_model(
         **{prop.name.lower(): prop.args.get("value") for prop in rendered_meta.expressions},
         **kwargs,
     }
+
+    # signals, audits and merge_filter must remain unrendered, so that they can be rendered later at evaluation runtime
     if unrendered_signals:
-        # Signals must remain unrendered, so that they can be rendered later at evaluation runtime.
         meta_fields["signals"] = unrendered_signals
+
+    if unrendered_audits:
+        meta_fields["audits"] = unrendered_audits
+
+    if unrendered_merge_filter:
+        for idx, kind_prop in enumerate(meta_fields["kind"].expressions):
+            if kind_prop.name.lower() == "merge_filter":
+                meta_fields["kind"].expressions[idx] = unrendered_merge_filter
 
     if isinstance(meta_fields.get("dialect"), exp.Expression):
         meta_fields["dialect"] = meta_fields["dialect"].name
@@ -1657,33 +1888,20 @@ def load_sql_based_model(
             path,
         )
 
-    jinja_macro_references, used_variables = extract_macro_references_and_variables(
-        *(gen(e) for e in pre_statements),
-        *(gen(e) for e in post_statements),
-        *([gen(query_or_seed_insert)] if query_or_seed_insert is not None else []),
-    )
-
-    jinja_macros = (jinja_macros or JinjaMacroRegistry()).trim(jinja_macro_references)
-    for jinja_macro in jinja_macros.root_macros.values():
-        used_variables.update(extract_macro_references_and_variables(jinja_macro.definition)[1])
-
     common_kwargs = dict(
         pre_statements=pre_statements,
         post_statements=post_statements,
-        audit_expressions=_extract_audit_expressions(
-            audits, inline_audits, model_audits, default_audits
-        ),
+        on_virtual_update=on_virtual_update,
         defaults=defaults,
         path=path,
         module_path=module_path,
         macros=macros,
         python_env=python_env,
         jinja_macros=jinja_macros,
-        jinja_macro_references=jinja_macro_references,
         physical_schema_mapping=physical_schema_mapping,
         default_catalog=default_catalog,
         variables=variables,
-        used_variables=used_variables,
+        default_audits=default_audits,
         inline_audits=inline_audits,
         **meta_fields,
     )
@@ -1704,42 +1922,23 @@ def load_sql_based_model(
             **common_kwargs,
         )
     else:
+        seed_properties = {
+            p.name.lower(): p.args.get("value") for p in common_kwargs.pop("kind").expressions
+        }
         try:
-            seed_properties = {
-                p.name.lower(): p.args.get("value") for p in common_kwargs.pop("kind").expressions
-            }
             return create_seed_model(
                 name,
                 SeedKind(**seed_properties),
                 **common_kwargs,
             )
         except Exception as ex:
-            raise_config_error(
-                f"The model definition must either have a SELECT query, a JINJA_QUERY block, or a valid Seed kind. {ex}.",
-                path,
-            )
+            raise_config_error(str(ex), path)
             raise
 
 
 def create_sql_model(
     name: TableName,
     query: exp.Expression,
-    *,
-    pre_statements: t.Optional[t.List[exp.Expression]] = None,
-    post_statements: t.Optional[t.List[exp.Expression]] = None,
-    audit_expressions: t.Optional[t.List[exp.Expression]] = None,
-    defaults: t.Optional[t.Dict[str, t.Any]] = None,
-    path: Path = Path(),
-    module_path: Path = Path(),
-    time_column_format: str = c.DEFAULT_TIME_COLUMN_FORMAT,
-    macros: t.Optional[MacroRegistry] = None,
-    python_env: t.Optional[t.Dict[str, Executable]] = None,
-    jinja_macros: t.Optional[JinjaMacroRegistry] = None,
-    jinja_macro_references: t.Optional[t.Set[MacroReference]] = None,
-    dialect: t.Optional[str] = None,
-    physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
-    variables: t.Optional[t.Dict[str, t.Any]] = None,
-    used_variables: t.Optional[t.Set[str]] = None,
     **kwargs: t.Any,
 ) -> Model:
     """Creates a SQL model.
@@ -1748,81 +1947,22 @@ def create_sql_model(
         name: The name of the model, which is of the form [catalog].[db].table.
             The catalog and db are optional.
         query: The model's logic in a form of a SELECT query.
-        pre_statements: The list of SQL statements that precede the model's query.
-        post_statements: The list of SQL statements that follow after the model's query.
-        defaults: Definition default values.
-        path: An optional path to the model definition file.
-        module_path: The python module path to serialize macros for.
-        time_column_format: The default time column format to use if no model time column is configured.
-            The format must adhere to Python's strftime codes.
-        macros: The custom registry of macros. If not provided the default registry will be used.
-        python_env: The custom Python environment for macros. If not provided the environment will be constructed
-            from the macro registry.
-        jinja_macros: The registry of Jinja macros.
-        jinja_macro_references: The set of Jinja macros referenced by this model.
-        dialect: The default dialect if no model dialect is configured.
-        physical_schema_mapping: A mapping of regular expressions to match against the model schema to produce the corresponding physical schema
-        variables: User-defined variables.
-        used_variables: The set of variable names used by this model.
     """
     if not isinstance(query, (exp.Query, d.JinjaQuery, d.MacroFunc)):
         raise_config_error(
             "A query is required and must be a SELECT statement, a UNION statement, or a JINJA_QUERY block",
-            path,
+            kwargs.get("path"),
         )
 
-    pre_statements = pre_statements or []
-    post_statements = post_statements or []
-    audit_expressions = audit_expressions or []
-
-    if not python_env:
-        python_env = _python_env(
-            [*pre_statements, query, *post_statements, *audit_expressions],
-            jinja_macro_references,
-            module_path,
-            macros or macro.get_registry(),
-            variables=variables,
-            used_variables=used_variables,
-            path=path,
-        )
-    else:
-        python_env = _add_variables_to_python_env(python_env, used_variables, variables)
-
-    return _create_model(
-        SqlModel,
-        name,
-        defaults=defaults,
-        path=path,
-        time_column_format=time_column_format,
-        python_env=python_env,
-        jinja_macros=jinja_macros,
-        dialect=dialect,
-        query=query,
-        pre_statements=pre_statements,
-        post_statements=post_statements,
-        physical_schema_mapping=physical_schema_mapping,
-        **kwargs,
-    )
+    return _create_model(SqlModel, name, query=query, **kwargs)
 
 
 def create_seed_model(
     name: TableName,
     seed_kind: SeedKind,
     *,
-    dialect: t.Optional[str] = None,
-    pre_statements: t.Optional[t.List[exp.Expression]] = None,
-    post_statements: t.Optional[t.List[exp.Expression]] = None,
-    audit_expressions: t.Optional[t.List[exp.Expression]] = None,
-    defaults: t.Optional[t.Dict[str, t.Any]] = None,
     path: Path = Path(),
     module_path: Path = Path(),
-    macros: t.Optional[MacroRegistry] = None,
-    python_env: t.Optional[t.Dict[str, Executable]] = None,
-    jinja_macros: t.Optional[JinjaMacroRegistry] = None,
-    jinja_macro_references: t.Optional[t.Set[MacroReference]] = None,
-    physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
-    variables: t.Optional[t.Dict[str, t.Any]] = None,
-    used_variables: t.Optional[t.Set[str]] = None,
     **kwargs: t.Any,
 ) -> Model:
     """Creates a Seed model.
@@ -1831,19 +1971,8 @@ def create_seed_model(
         name: The name of the model, which is of the form [catalog].[db].table.
             The catalog and db are optional.
         seed_kind: The information about the location of a seed and other related configuration.
-        dialect: The default dialect if no model dialect is configured.
-        pre_statements: The list of SQL statements that precede the insertion of the seed's content.
-        post_statements: The list of SQL statements that follow after the insertion of the seed's content.
-        defaults: Definition default values.
         path: An optional path to the model definition file.
-        macros: The custom registry of macros. If not provided the default registry will be used.
-        python_env: The custom Python environment for macros. If not provided the environment will be constructed
             from the macro registry.
-        jinja_macros: The registry of Jinja macros.
-        jinja_macro_references: The set of Jinja macros referenced by this model.
-        physical_schema_mapping: A mapping of regular expressions to match against the model schema to produce the corresponding physical schema
-        variables: User-defined variables.
-        used_variables: The set of variable names used by this model.
     """
     seed_path = Path(seed_kind.path)
     marker, *subdirs = seed_path.parts
@@ -1855,37 +1984,14 @@ def create_seed_model(
 
     seed = create_seed(seed_path)
 
-    pre_statements = pre_statements or []
-    post_statements = post_statements or []
-    audit_expressions = audit_expressions or []
-
-    if not python_env:
-        python_env = _python_env(
-            [*pre_statements, *post_statements, *audit_expressions],
-            jinja_macro_references,
-            module_path,
-            macros or macro.get_registry(),
-            variables=variables,
-            used_variables=used_variables,
-            path=path,
-        )
-    else:
-        python_env = _add_variables_to_python_env(python_env, used_variables, variables)
-
     return _create_model(
         SeedModel,
         name,
-        dialect=dialect,
-        defaults=defaults,
         path=path,
         seed=seed,
         kind=seed_kind,
         depends_on=kwargs.pop("depends_on", None),
-        python_env=python_env,
-        jinja_macros=jinja_macros,
-        pre_statements=pre_statements,
-        post_statements=post_statements,
-        physical_schema_mapping=physical_schema_mapping,
+        module_path=module_path,
         **kwargs,
     )
 
@@ -1897,12 +2003,9 @@ def create_python_model(
     *,
     macros: t.Optional[MacroRegistry] = None,
     jinja_macros: t.Optional[JinjaMacroRegistry] = None,
-    defaults: t.Optional[t.Dict[str, t.Any]] = None,
     path: Path = Path(),
     module_path: Path = Path(),
-    time_column_format: str = c.DEFAULT_TIME_COLUMN_FORMAT,
     depends_on: t.Optional[t.Set[str]] = None,
-    physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
     variables: t.Optional[t.Dict[str, t.Any]] = None,
     **kwargs: t.Any,
 ) -> Model:
@@ -1913,57 +2016,50 @@ def create_python_model(
             The catalog and db are optional.
         entrypoint: The name of a Python function which contains the data fetching / transformation logic.
         python_env: The Python environment of all objects referenced by the model implementation.
-        defaults: Definition default values.
         path: An optional path to the model definition file.
-        time_column_format: The default time column format to use if no model time column is configured.
         depends_on: The custom set of model's upstream dependencies.
+        variables: The variables to pass to the model.
     """
     # Find dependencies for python models by parsing code if they are not explicitly defined
     # Also remove self-references that are found
 
-    pre_statements = kwargs.get("pre_statements", None) or []
-    post_statements = kwargs.get("post_statements", None) or []
-
-    if pre_statements or post_statements:
-        jinja_macro_references, used_variables = extract_macro_references_and_variables(
-            *(gen(e) for e in pre_statements),
-            *(gen(e) for e in post_statements),
-        )
-
-        jinja_macros = (jinja_macros or JinjaMacroRegistry()).trim(jinja_macro_references)
-        for jinja_macro in jinja_macros.root_macros.values():
-            used_variables.update(extract_macro_references_and_variables(jinja_macro.definition)[1])
-
-        python_env.update(
-            _python_env(
-                [*pre_statements, *post_statements],
-                jinja_macro_references,
-                module_path,
-                macros or macro.get_registry(),
-                variables=variables,
-                used_variables=used_variables,
-                path=path,
-            )
-        )
-
     dialect = kwargs.get("dialect")
+    renderer_kwargs = {
+        "module_path": module_path,
+        "macros": macros,
+        "jinja_macros": jinja_macros,
+        "variables": variables,
+        "path": path,
+        "dialect": dialect,
+        "default_catalog": kwargs.get("default_catalog"),
+    }
+
     name_renderer = _meta_renderer(
         expression=d.parse_one(name, dialect=dialect),
-        module_path=module_path,
-        macros=macros,
-        jinja_macros=jinja_macros,
-        variables=variables,
-        path=path,
-        dialect=dialect,
-        default_catalog=kwargs.get("default_catalog"),
+        **renderer_kwargs,  # type: ignore
     )
     name = t.cast(t.List[exp.Expression], name_renderer.render())[0].sql(dialect=dialect)
 
+    dependencies_unspecified = depends_on is None
+
     parsed_depends_on, referenced_variables = (
-        _parse_dependencies(python_env, entrypoint) if python_env is not None else (set(), set())
+        parse_dependencies(python_env, entrypoint, strict_resolution=dependencies_unspecified)
+        if python_env is not None
+        else (set(), set())
     )
-    if depends_on is None:
+    if dependencies_unspecified:
         depends_on = parsed_depends_on - {name}
+    else:
+        depends_on_renderer = _meta_renderer(
+            expression=exp.Array(
+                expressions=[d.parse_one(dep, dialect=dialect) for dep in depends_on or []]
+            ),
+            **renderer_kwargs,  # type: ignore
+        )
+        depends_on = {
+            dep.sql(dialect=dialect)
+            for dep in t.cast(t.List[exp.Expression], depends_on_renderer.render())[0].expressions
+        }
 
     variables = {k: v for k, v in (variables or {}).items() if k in referenced_variables}
     if variables:
@@ -1972,14 +2068,14 @@ def create_python_model(
     return _create_model(
         PythonModel,
         name,
-        defaults=defaults,
         path=path,
-        time_column_format=time_column_format,
         depends_on=depends_on,
         entrypoint=entrypoint,
         python_env=python_env,
+        macros=macros,
         jinja_macros=jinja_macros,
-        physical_schema_mapping=physical_schema_mapping,
+        module_path=module_path,
+        variables=variables,
         **kwargs,
     )
 
@@ -2026,13 +2122,20 @@ def _create_model(
     depends_on: t.Optional[t.Set[str]] = None,
     dialect: t.Optional[str] = None,
     physical_schema_mapping: t.Optional[t.Dict[re.Pattern, str]] = None,
+    python_env: t.Optional[t.Dict[str, Executable]] = None,
+    audit_definitions: t.Optional[t.Dict[str, ModelAudit]] = None,
+    default_audits: t.Optional[t.List[FunctionCall]] = None,
+    inline_audits: t.Optional[t.Dict[str, ModelAudit]] = None,
+    module_path: Path = Path(),
+    macros: t.Optional[MacroRegistry] = None,
+    signal_definitions: t.Optional[SignalRegistry] = None,
+    variables: t.Optional[t.Dict[str, t.Any]] = None,
     **kwargs: t.Any,
 ) -> Model:
     _validate_model_fields(klass, {"name", *kwargs} - {"grain", "table_properties"}, path)
 
-    kwargs["session_properties"] = _resolve_session_properties(
-        (defaults or {}).get("session_properties"), kwargs.get("session_properties")
-    )
+    for prop in ["session_properties", "physical_properties", "virtual_properties"]:
+        kwargs[prop] = _resolve_properties((defaults or {}).get(prop), kwargs.get(prop))
 
     dialect = dialect or ""
 
@@ -2050,6 +2153,34 @@ def _create_model(
         kwargs["kind"] = create_model_kind(raw_kind, dialect, defaults or {})
 
     defaults = {k: v for k, v in (defaults or {}).items() if k in klass.all_fields()}
+    if not issubclass(klass, SqlModel):
+        defaults.pop("optimize_query", None)
+        defaults.pop("validate_query", None)
+
+    statements = []
+
+    if "pre_statements" in kwargs:
+        statements.extend(kwargs["pre_statements"])
+    if "query" in kwargs:
+        statements.append(kwargs["query"])
+    if "post_statements" in kwargs:
+        statements.extend(kwargs["post_statements"])
+    if "on_virtual_update" in kwargs:
+        statements.extend(kwargs["on_virtual_update"])
+
+    jinja_macro_references, used_variables = extract_macro_references_and_variables(
+        *(gen(e) for e in statements)
+    )
+
+    if jinja_macros:
+        jinja_macros = (
+            jinja_macros if jinja_macros.trimmed else jinja_macros.trim(jinja_macro_references)
+        )
+    else:
+        jinja_macros = JinjaMacroRegistry()
+
+    for jinja_macro in jinja_macros.root_macros.values():
+        used_variables.update(extract_macro_references_and_variables(jinja_macro.definition)[1])
 
     try:
         model = klass(
@@ -2067,6 +2198,48 @@ def _create_model(
         raise_config_error(str(ex), location=path)
         raise
 
+    audit_definitions = audit_definitions or {}
+    inline_audits = inline_audits or {}
+    audit_definitions = {**audit_definitions, **inline_audits}
+
+    used_audits = set(inline_audits)
+    used_audits.update(audit_name for audit_name, _ in default_audits or [])
+    used_audits.update(audit_name for audit_name, _ in model.audits)
+
+    audit_definitions = {
+        audit_name: audit_definitions[audit_name]
+        for audit_name in used_audits
+        if audit_name in audit_definitions
+    }
+
+    model.audit_definitions.update(audit_definitions)
+
+    statements.extend(audit.query for audit in audit_definitions.values())
+
+    python_env = python_env or {}
+
+    make_python_env(
+        statements,
+        jinja_macro_references,
+        module_path,
+        macros or macro.get_registry(),
+        variables=variables,
+        used_variables=used_variables,
+        path=path,
+        python_env=python_env,
+        strict_resolution=depends_on is None,
+    )
+
+    env: t.Dict[str, t.Any] = {}
+
+    for signal_name, _ in model.signals:
+        if signal_definitions and signal_name in signal_definitions:
+            func = signal_definitions[signal_name].func
+            setattr(func, c.SQLMESH_METADATA, True)
+            build_env(func, env=env, name=signal_name, path=module_path)
+
+    model.python_env.update(python_env)
+    model.python_env.update(serialize_env(env, path=module_path))
     model._path = path
     model.set_time_format(time_column_format)
 
@@ -2082,6 +2255,7 @@ def _split_sql_model_statements(
     dialect: t.Optional[str] = None,
 ) -> t.Tuple[
     t.Optional[exp.Expression],
+    t.List[exp.Expression],
     t.List[exp.Expression],
     t.List[exp.Expression],
     UniqueKeyDict[str, ModelAudit],
@@ -2102,6 +2276,7 @@ def _split_sql_model_statements(
 
     query_positions = []
     sql_statements = []
+    on_virtual_update = []
     inline_audits: UniqueKeyDict[str, ModelAudit] = UniqueKeyDict("inline_audits")
 
     idx = 0
@@ -2114,6 +2289,10 @@ def _split_sql_model_statements(
             assert isinstance(loaded_audit, ModelAudit)
             inline_audits[loaded_audit.name] = loaded_audit
             idx += 2
+        elif isinstance(expr, d.VirtualUpdateStatement):
+            for statement in expr.expressions:
+                on_virtual_update.append(statement)
+            idx += 1
         else:
             if (
                 isinstance(expr, (exp.Query, d.JinjaQuery))
@@ -2128,34 +2307,36 @@ def _split_sql_model_statements(
             idx += 1
 
     if not query_positions:
-        return None, sql_statements, [], inline_audits
+        return None, sql_statements, [], on_virtual_update, inline_audits
 
     elif len(query_positions) > 1:
         raise_config_error("Only one SELECT query is allowed per model", path)
 
     query, pos = query_positions[0]
-    return query, sql_statements[:pos], sql_statements[pos + 1 :], inline_audits
+    return query, sql_statements[:pos], sql_statements[pos + 1 :], on_virtual_update, inline_audits
 
 
-def _resolve_session_properties(
+def _resolve_properties(
     default: t.Optional[t.Dict[str, t.Any]],
     provided: t.Optional[exp.Expression | t.Dict[str, t.Any]],
 ) -> t.Optional[exp.Expression]:
     if isinstance(provided, dict):
-        session_properties = {k: exp.Literal.string(k).eq(v) for k, v in provided.items()}
+        properties = {k: exp.Literal.string(k).eq(v) for k, v in provided.items()}
     elif provided:
         if isinstance(provided, exp.Paren):
             provided = exp.Tuple(expressions=[provided.this])
-        session_properties = {expr.this.name: expr for expr in provided}
+        properties = {expr.this.name: expr for expr in provided}
     else:
-        session_properties = {}
+        properties = {}
 
     for k, v in (default or {}).items():
-        if k not in session_properties:
-            session_properties[k] = exp.Literal.string(k).eq(v)
+        if k not in properties:
+            properties[k] = exp.Literal.string(k).eq(v)
+        elif properties[k].expression.sql().lower() in {"none", "null"}:
+            del properties[k]
 
-    if session_properties:
-        return exp.Tuple(expressions=list(session_properties.values()))
+    if properties:
+        return exp.Tuple(expressions=list(properties.values()))
 
     return None
 
@@ -2173,148 +2354,6 @@ def _validate_model_fields(klass: t.Type[_Model], provided_fields: t.Set[str], p
         raise_config_error(f"Invalid extra fields {extra_fields} in the model definition", path)
 
 
-def _python_env(
-    expressions: t.Union[exp.Expression, t.List[exp.Expression]],
-    jinja_macro_references: t.Optional[t.Set[MacroReference]],
-    module_path: Path,
-    macros: MacroRegistry,
-    variables: t.Optional[t.Dict[str, t.Any]] = None,
-    used_variables: t.Optional[t.Set[str]] = None,
-    path: t.Optional[str | Path] = None,
-) -> t.Dict[str, Executable]:
-    python_env: t.Dict[str, Executable] = {}
-    variables = variables or {}
-
-    used_macros = {}
-    used_variables = (used_variables or set()).copy()
-    serialized_env = {}
-
-    expressions = ensure_list(expressions)
-    for expression in expressions:
-        if not isinstance(expression, d.Jinja):
-            for macro_func_or_var in expression.find_all(d.MacroFunc, d.MacroVar, exp.Identifier):
-                if macro_func_or_var.__class__ is d.MacroFunc:
-                    name = macro_func_or_var.this.name.lower()
-                    if name in macros:
-                        used_macros[name] = macros[name]
-                        if name == c.VAR:
-                            args = macro_func_or_var.this.expressions
-                            if len(args) < 1:
-                                raise_config_error("Macro VAR requires at least one argument", path)
-                            if not args[0].is_string:
-                                raise_config_error(
-                                    f"The variable name must be a string literal, '{args[0].sql()}' was given instead",
-                                    path,
-                                )
-                            used_variables.add(args[0].this.lower())
-                elif macro_func_or_var.__class__ is d.MacroVar:
-                    name = macro_func_or_var.name.lower()
-                    if name in macros:
-                        used_macros[name] = macros[name]
-                    elif name in variables:
-                        used_variables.add(name)
-                elif (
-                    isinstance(macro_func_or_var, (exp.Identifier, d.MacroStrReplace, d.MacroSQL))
-                ) and "@" in macro_func_or_var.name:
-                    for _, identifier, braced_identifier, _ in MacroStrTemplate.pattern.findall(
-                        macro_func_or_var.name
-                    ):
-                        var_name = braced_identifier or identifier
-                        if var_name in variables:
-                            used_variables.add(var_name)
-
-    for macro_ref in jinja_macro_references or set():
-        if macro_ref.package is None and macro_ref.name in macros:
-            used_macros[macro_ref.name] = macros[macro_ref.name]
-
-    for name, used_macro in used_macros.items():
-        if isinstance(used_macro, Executable):
-            serialized_env[name] = used_macro
-        elif not hasattr(used_macro, c.SQLMESH_BUILTIN):
-            build_env(used_macro.func, env=python_env, name=name, path=module_path)
-
-    serialized_env.update(serialize_env(python_env, path=module_path))
-    return _add_variables_to_python_env(serialized_env, used_variables, variables)
-
-
-def _add_variables_to_python_env(
-    python_env: t.Dict[str, Executable],
-    used_variables: t.Optional[t.Set[str]],
-    variables: t.Optional[t.Dict[str, t.Any]],
-) -> t.Dict[str, Executable]:
-    _, python_used_variables = _parse_dependencies(python_env, None)
-    used_variables = (used_variables or set()) | python_used_variables
-
-    variables = {k: v for k, v in (variables or {}).items() if k in used_variables}
-    if variables:
-        python_env[c.SQLMESH_VARS] = Executable.value(variables)
-
-    return python_env
-
-
-def _parse_dependencies(
-    python_env: t.Dict[str, Executable], entrypoint: t.Optional[str]
-) -> t.Tuple[t.Set[str], t.Set[str]]:
-    """Parses the source of a model function and finds upstream table dependencies and referenced variables based on calls to context / evaluator.
-
-    Args:
-        python_env: A dictionary of Python definitions.
-
-    Returns:
-        A tuple containing the set of upstream table dependencies and the set of referenced variables.
-    """
-    env = prepare_env(python_env)
-    depends_on = set()
-    variables = set()
-
-    for executable in python_env.values():
-        if not executable.is_definition:
-            continue
-        for node in ast.walk(ast.parse(executable.payload)):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
-                    continue
-
-                def get_first_arg(keyword_arg_name: str) -> t.Any:
-                    if node.args:
-                        first_arg: t.Optional[ast.expr] = node.args[0]
-                    else:
-                        first_arg = next(
-                            (
-                                keyword.value
-                                for keyword in node.keywords
-                                if keyword.arg == keyword_arg_name
-                            ),
-                            None,
-                        )
-
-                    try:
-                        expression = to_source(first_arg)
-                        return eval(expression, env)
-                    except Exception:
-                        raise ConfigError(
-                            f"Error resolving dependencies for '{executable.path}'. Argument '{expression.strip()}' must be resolvable at parse time."
-                        )
-
-                if func.value.id == "context" and func.attr == "table":
-                    depends_on.add(get_first_arg("model_name"))
-                elif func.value.id in ("context", "evaluator") and func.attr == c.VAR:
-                    variables.add(get_first_arg("var_name").lower())
-            elif (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in ("context", "evaluator")
-                and node.attr == c.GATEWAY
-            ):
-                # Check whether the gateway attribute is referenced.
-                variables.add(c.GATEWAY)
-            elif isinstance(node, ast.FunctionDef) and node.name == entrypoint:
-                variables.update([arg.arg for arg in node.args.args if arg.arg != "context"])
-
-    return depends_on, variables
-
-
 def _list_of_calls_to_exp(value: t.List[t.Tuple[str, t.Dict[str, t.Any]]]) -> exp.Expression:
     return exp.Tuple(
         expressions=[
@@ -2330,56 +2369,9 @@ def _list_of_calls_to_exp(value: t.List[t.Tuple[str, t.Dict[str, t.Any]]]) -> ex
     )
 
 
-def _extract_audit_expressions(
-    audits: t.Optional[dict[str, Audit]] = None,
-    inline_audits: t.Optional[t.Mapping[str, Audit]] = None,
-    model_audits: t.Optional[t.Any] = None,
-    default_audits: t.Optional[t.List[AuditReference]] = None,
-) -> list:
-    audit_names = []
-    if model_audits:
-        if isinstance(model_audits, (exp.Tuple, exp.Array)):
-            audit_names = [extract_audit(i)[0] for i in model_audits.expressions]
-        elif isinstance(model_audits, exp.Paren):
-            audit_names = [extract_audit(model_audits.this)[0]]
-        elif isinstance(model_audits, exp.Expression):
-            audit_names = [extract_audit(model_audits)[0]]
-
-    if default_audits:
-        for audit_name, _ in default_audits:
-            audit_names.append(audit_name)
-
-    audit_expressions = []
-    if audit_names and audits:
-        for audit_name in audit_names:
-            audit = audits.get(audit_name)
-            if audit:
-                audit_expressions.append(audit.query)
-    if inline_audits:
-        for audit_name in inline_audits:
-            audit_expressions.append(inline_audits[audit_name].query)
-
-    return audit_expressions
-
-
 def _is_projection(expr: exp.Expression) -> bool:
     parent = expr.parent
     return isinstance(parent, exp.Select) and expr.arg_key == "expressions"
-
-
-def _is_udtf(expr: exp.Expression) -> bool:
-    return isinstance(expr, (exp.Explode, exp.Posexplode, exp.Unnest)) or (
-        isinstance(expr, exp.Anonymous)
-        and expr.this.upper() in ("EXPLODE_OUTER", "POSEXPLODE_OUTER", "UNNEST")
-    )
-
-
-def _single_value_or_tuple(values: t.Sequence) -> exp.Identifier | exp.Tuple:
-    return (
-        exp.to_identifier(values[0])
-        if len(values) == 1
-        else exp.Tuple(expressions=[exp.to_identifier(v) for v in values])
-    )
 
 
 def _single_expr_or_tuple(values: t.Sequence[exp.Expression]) -> exp.Expression | exp.Tuple:
@@ -2400,7 +2392,7 @@ def _meta_renderer(
     variables: t.Optional[t.Dict[str, t.Any]] = None,
     default_catalog: t.Optional[str] = None,
 ) -> ExpressionRenderer:
-    meta_python_env = _python_env(
+    meta_python_env = make_python_env(
         expressions=expression,
         jinja_macro_references=None,
         module_path=module_path,
@@ -2425,7 +2417,7 @@ META_FIELD_CONVERTER: t.Dict[str, t.Callable] = {
     "start": lambda value: exp.Literal.string(value),
     "cron": lambda value: exp.Literal.string(value),
     "partitioned_by_": _single_expr_or_tuple,
-    "clustered_by": _single_value_or_tuple,
+    "clustered_by": _single_expr_or_tuple,
     "depends_on_": lambda value: exp.Tuple(expressions=sorted(value)),
     "pre": _list_of_calls_to_exp,
     "post": _list_of_calls_to_exp,
@@ -2433,17 +2425,68 @@ META_FIELD_CONVERTER: t.Dict[str, t.Callable] = {
     "columns_to_types_": lambda value: exp.Schema(
         expressions=[exp.ColumnDef(this=exp.to_column(c), kind=t) for c, t in value.items()]
     ),
-    "tags": _single_value_or_tuple,
+    "tags": single_value_or_tuple,
     "grains": _refs_to_sql,
     "references": _refs_to_sql,
     "physical_properties_": lambda value: value,
     "virtual_properties_": lambda value: value,
     "session_properties_": lambda value: value,
     "allow_partials": exp.convert,
-    "signals": lambda values: exp.Tuple(expressions=values),
+    "signals": lambda values: exp.tuple_(
+        *(
+            exp.func(
+                name, *(exp.PropertyEQ(this=exp.var(k), expression=v) for k, v in args.items())
+            )
+            if name
+            else exp.Tuple(expressions=[exp.var(k).eq(v) for k, v in args.items()])
+            for name, args in values
+        )
+    ),
 }
 
 
 def get_model_name(path: Path) -> str:
     path_parts = list(path.parts[path.parts.index("models") + 1 : -1]) + [path.stem]
     return ".".join(path_parts[-3:])
+
+
+# function applied to time column when automatically used for partitioning in INCREMENTAL_BY_TIME_RANGE models
+def clickhouse_partition_func(
+    column: exp.Expression, columns_to_types: t.Optional[t.Dict[str, exp.DataType]]
+) -> exp.Expression:
+    # `toMonday()` function accepts a Date or DateTime type column
+
+    col_type = (columns_to_types and columns_to_types.get(column.name)) or exp.DataType.build(
+        "UNKNOWN"
+    )
+    col_type_is_conformable = col_type.is_type(
+        exp.DataType.Type.DATE,
+        exp.DataType.Type.DATE32,
+        exp.DataType.Type.DATETIME,
+        exp.DataType.Type.DATETIME64,
+    )
+
+    #  if input column is already a conformable type, just pass the column
+    if col_type_is_conformable:
+        return exp.func("toMonday", column, dialect="clickhouse")
+
+    # if input column type is not known, cast input to DateTime64
+    if col_type.is_type(exp.DataType.Type.UNKNOWN):
+        return exp.func(
+            "toMonday",
+            exp.cast(column, exp.DataType.build("DateTime64(9, 'UTC')", dialect="clickhouse")),
+            dialect="clickhouse",
+        )
+
+    # if input column type is known but not conformable, cast input to DateTime64 and cast output back to original type
+    return exp.cast(
+        exp.func(
+            "toMonday",
+            exp.cast(column, exp.DataType.build("DateTime64(9, 'UTC')", dialect="clickhouse")),
+            dialect="clickhouse",
+        ),
+        col_type,
+    )
+
+
+TIME_COL_PARTITION_FUNC = {"clickhouse": clickhouse_partition_func}

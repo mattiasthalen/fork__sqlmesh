@@ -20,7 +20,6 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 if t.TYPE_CHECKING:
-    from sqlmesh.core.audit import ModelAudit
     from sqlmesh.core.snapshot import SnapshotId
 
     T = t.TypeVar("T")
@@ -132,36 +131,29 @@ class OptimizedQueryCache:
     @staticmethod
     def _entry_name(model: SqlModel) -> str:
         hash_data = _mapping_schema_hash_data(model.mapping_schema)
-        hash_data.append(gen(model.query))
+        hash_data.append(gen(model.query, comments=True))
         hash_data.append(str([gen(d) for d in model.macro_definitions]))
         hash_data.append(str([(k, v) for k, v in model.sorted_python_env]))
         hash_data.extend(model.jinja_macros.data_hash_values)
+        hash_data.extend(str(model.validate_query))
         return f"{model.name}_{crc32(hash_data)}"
 
 
-def optimized_query_cache_pool(
-    optimized_query_cache: OptimizedQueryCache,
-    audits: t.Optional[t.Dict[str, ModelAudit]] = None,
-) -> ProcessPoolExecutor:
+def optimized_query_cache_pool(optimized_query_cache: OptimizedQueryCache) -> ProcessPoolExecutor:
     return ProcessPoolExecutor(
         mp_context=mp.get_context("fork"),
         initializer=_init_optimized_query_cache,
-        initargs=(optimized_query_cache, audits),
+        initargs=(optimized_query_cache,),
         max_workers=c.MAX_FORK_WORKERS,
     )
 
 
 _optimized_query_cache: t.Optional[OptimizedQueryCache] = None
-_audits: t.Optional[t.Dict[str, ModelAudit]] = None
 
 
-def _init_optimized_query_cache(
-    optimized_query_cache: OptimizedQueryCache,
-    audits: t.Optional[t.Dict[str, ModelAudit]] = None,
-) -> None:
-    global _optimized_query_cache, _audits
+def _init_optimized_query_cache(optimized_query_cache: OptimizedQueryCache) -> None:
+    global _optimized_query_cache
     _optimized_query_cache = optimized_query_cache
-    _audits = audits
 
 
 def load_optimized_query(
@@ -181,7 +173,6 @@ def load_optimized_query_and_mapping(
     model: Model, mapping: t.Dict
 ) -> t.Tuple[str, t.Optional[str], str, str, t.Dict]:
     assert _optimized_query_cache
-    assert _audits is not None
 
     schema = MappingSchema(normalize=False)
     for parent, columns_to_types in mapping.items():
@@ -198,7 +189,7 @@ def load_optimized_query_and_mapping(
         model.fqn,
         entry_name,
         model.data_hash,
-        model.metadata_hash(_audits),
+        model.metadata_hash,
         model.mapping_schema,
     )
 

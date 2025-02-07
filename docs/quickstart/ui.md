@@ -1,6 +1,6 @@
 # Browser UI
 
-In this quick start guide, you'll use the SQLMesh browser user interface to get up and running with SQLMesh's scaffold generator. This example project will run locally on your computer using [DuckDB](https://duckdb.org/) as an embedded SQL engine.
+In this quickstart, you'll use the SQLMesh browser user interface to get up and running with SQLMesh's scaffold generator. This example project will run locally on your computer using [DuckDB](https://duckdb.org/) as an embedded SQL engine.
 
 ??? info "Learn more about the quickstart project structure"
     This project demonstrates key SQLMesh features by walking through the SQLMesh workflow on a simple data pipeline. This section describes the project structure and the SQLMesh concepts you will encounter as you work through it.
@@ -166,7 +166,7 @@ The SQLMesh UI default view contains five panes:
 
 It also contains nine buttons:
 
-1. Toggle Editor/Docs/Errors toggles among the Code Editor (default), Docs, and Errors views. Errors view is only available if an error has occurred.
+1. Toggle Editor/Data Catalog/Errors toggles among the Code Editor (default), Data Catalog, and Errors views. Errors view is only available if an error has occurred.
 2. History navigation returns to previous views, similar to the back button in a web browser.
 3. Add new tab opens a new code editor window.
 4. Run plan command executes the [`sqlmesh plan` command](../reference/cli.md#plan).

@@ -11,6 +11,7 @@ from sqlmesh.core.dialect import to_schema
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
     HiveMetastoreTablePropertiesMixin,
+    RowDiffMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CatalogSupport,
@@ -44,11 +45,12 @@ logger = logging.getLogger(__name__)
 
 
 @set_catalog()
-class SparkEngineAdapter(GetCurrentCatalogFromFunctionMixin, HiveMetastoreTablePropertiesMixin):
+class SparkEngineAdapter(
+    GetCurrentCatalogFromFunctionMixin, HiveMetastoreTablePropertiesMixin, RowDiffMixin
+):
     DIALECT = "spark"
     SUPPORTS_TRANSACTIONS = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.INSERT_OVERWRITE
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     COMMENT_CREATION_TABLE = CommentCreationTable.IN_SCHEMA_DEF_NO_CTAS
     COMMENT_CREATION_VIEW = CommentCreationView.IN_SCHEMA_DEF_NO_COMMANDS
     # Note: Some formats (like Delta and Iceberg) support REPLACE TABLE but since we don't
@@ -81,6 +83,10 @@ class SparkEngineAdapter(GetCurrentCatalogFromFunctionMixin, HiveMetastoreTableP
     def use_serverless(self) -> bool:
         return False
 
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
+
     @classproperty
     def _sqlglot_to_spark_primitive_mapping(self) -> t.Dict[t.Any, t.Any]:
         from pyspark.sql import types as spark_types
@@ -101,8 +107,8 @@ class SparkEngineAdapter(GetCurrentCatalogFromFunctionMixin, HiveMetastoreTableP
             exp.DataType.Type.DATE: spark_types.DateType,
             exp.DataType.Type.DATETIME: spark_types.TimestampNTZType,
             exp.DataType.Type.TIMESTAMPLTZ: spark_types.TimestampType,
-            exp.DataType.Type.TIMESTAMPTZ: spark_types.TimestampType,
             exp.DataType.Type.TIMESTAMP: spark_types.TimestampType,
+            exp.DataType.Type.TIMESTAMPTZ: spark_types.TimestampType,
         }
 
     @classproperty
@@ -192,9 +198,9 @@ class SparkEngineAdapter(GetCurrentCatalogFromFunctionMixin, HiveMetastoreTableP
                     else partial(sqlglot_complex_to_spark_complex, data_type)
                 )
                 if is_struct:
-                    expressions.append(spark_types.StructField(col_name, type_func()))
+                    expressions.append(spark_types.StructField(col_name, type_func()))  # type: ignore
                 else:
-                    expressions.append(type_func())
+                    expressions.append(type_func())  # type: ignore
             klass = cls._sqlglot_to_spark_complex_mapping[complex_type.this]
             if is_struct:
                 return klass(expressions)

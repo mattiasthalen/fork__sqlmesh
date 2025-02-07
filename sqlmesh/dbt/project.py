@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import logging
 import typing as t
+import logging
 from pathlib import Path
 
+from sqlmesh.core.console import get_console
 from sqlmesh.dbt.common import PROJECT_FILENAME, load_yaml
 from sqlmesh.dbt.context import DbtContext
 from sqlmesh.dbt.manifest import ManifestHelper
@@ -56,9 +57,6 @@ class Project:
 
         variable_overrides = variables
         variables = {**project_yaml.get("vars", {}), **(variables or {})}
-        global_variables = {
-            name: var for name, var in variables.items() if not isinstance(var, dict)
-        }
 
         project_name = context.render(project_yaml.get("name", ""))
         context.project_name = project_name
@@ -82,8 +80,8 @@ class Project:
         extra_fields = profile.target.extra
         if extra_fields:
             extra_str = ",".join(f"'{field}'" for field in extra_fields)
-            logger.warning(
-                "%s adapter does not currently support %s", profile.target.type, extra_str
+            get_console().log_warning(
+                f"{profile.target.type} adapter does not currently support {extra_str}."
             )
 
         packages = {}
@@ -107,7 +105,7 @@ class Project:
             if isinstance(package_vars, dict):
                 package.variables.update(package_vars)
 
-            package.variables.update(global_variables)
+            package.variables.update(variables)
 
         return Project(context, profile, packages)
 

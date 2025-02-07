@@ -61,6 +61,10 @@ class JinjaStatement(Jinja):
     pass
 
 
+class VirtualUpdateStatement(exp.Expression):
+    arg_types = {"expressions": True}
+
+
 class ModelKind(exp.Expression):
     arg_types = {"this": True, "expressions": False}
 
@@ -116,6 +120,7 @@ def _parse_statement(self: Parser) -> t.Optional[exp.Expression]:
         return None
 
     parser = PARSERS.get(self._curr.text.upper())
+    error_msg = None
 
     if parser:
         # Capture any available description in the form of a comment
@@ -125,7 +130,8 @@ def _parse_statement(self: Parser) -> t.Optional[exp.Expression]:
         try:
             self._advance()
             meta = self._parse_wrapped(lambda: t.cast(t.Callable, parser)(self))
-        except ParseError:
+        except ParseError as parse_error:
+            error_msg = parse_error.args[0]
             self._retreat(index)
 
         # Only return the DDL expression if we actually managed to parse one. This is
@@ -135,7 +141,12 @@ def _parse_statement(self: Parser) -> t.Optional[exp.Expression]:
             meta.comments = comments
             return meta
 
-    return self.__parse_statement()  # type: ignore
+    try:
+        return self.__parse_statement()  # type: ignore
+    except ParseError:
+        if error_msg:
+            raise ParseError(error_msg)
+        raise
 
 
 def _parse_lambda(self: Parser, alias: bool = False) -> t.Optional[exp.Expression]:
@@ -318,9 +329,11 @@ def _parse_join(
 
 
 def _warn_unsupported(self: Parser) -> None:
+    from sqlmesh.core.console import get_console
+
     sql = self._find_sql(self._tokens[0], self._tokens[-1])[: self.error_message_context]
 
-    logger.warning(
+    get_console().log_warning(
         f"'{sql}' could not be semantically understood as it contains unsupported syntax, SQLMesh will treat the command as is. Note that any references to the model's "
         "underlying physical table can't be resolved in this case, consider using Jinja as explained here https://sqlmesh.readthedocs.io/en/stable/concepts/macros/macro_variables/#audit-only-variables"
     )
@@ -403,19 +416,27 @@ def _parse_limit(
     return macro
 
 
+def _parse_macro_or_clause(self: Parser, parser: t.Callable) -> t.Optional[exp.Expression]:
+    return _parse_macro(self) if self._match(TokenType.PARAMETER) else parser()
+
+
 def _parse_props(self: Parser) -> t.Optional[exp.Expression]:
     key = self._parse_id_var(any_token=True)
     if not key:
         return None
 
     name = key.name.lower()
-    if name == "when_matched":
-        value: t.Optional[t.Union[exp.Expression, t.List[exp.Expression]]] = (
-            self._parse_when_matched()  # type: ignore
-        )
-    elif name == "time_data_type":
+    if name == "time_data_type":
         # TODO: if we make *_data_type a convention to parse things into exp.DataType, we could make this more generic
         value = self._parse_types(schema=True)
+    elif name == "when_matched":
+        # Parentheses around the WHEN clauses can be used to disambiguate them from other properties
+        value = self._parse_wrapped(
+            lambda: _parse_macro_or_clause(self, self._parse_when_matched),
+            optional=True,
+        )
+    elif name == "merge_filter":
+        value = self._parse_conjunction()
     elif self._match(TokenType.L_PAREN):
         value = self.expression(exp.Tuple, expressions=self._parse_csv(self._parse_equality))
         self._match_r_paren()
@@ -464,11 +485,23 @@ def _parse_table_parts(
     name = table_arg.name
 
     if isinstance(table_arg, exp.Var) and name.startswith(SQLMESH_MACRO_PREFIX):
-        # Macro functions do not clash with the staged file syntax, so we can safely parse them
-        from sqlmesh.core.macros import macro
-
-        macros = macro.get_registry()
-        if self._prev.token_type == TokenType.STRING or "{" in name or name[1:].lower() in macros:
+        # In these cases, we don't want to produce a `StagedFilePath` node:
+        #
+        # - @'...' needs to parsed as a string template
+        # - @{foo}.bar needs to be parsed as a table with a macro var part
+        # - @name(arg1 [, arg2 ...]) needs to be parsed as a macro function call
+        #
+        # These cases can unambiguously be parsed using the base `_parse_table_parts`, as there
+        # is no overlap with staged files https://docs.snowflake.com/en/user-guide/querying-stage
+        if (
+            self._prev.token_type == TokenType.STRING
+            or "{" in name
+            or (
+                self._curr
+                and self._prev.token_type in (TokenType.L_PAREN, TokenType.R_PAREN)
+                and self._curr.text.upper() not in ("FILE_FORMAT", "PATTERN")
+            )
+        ):
             self._retreat(index)
             return Parser._parse_table_parts(self, schema=schema, is_db_reference=is_db_reference)
 
@@ -537,14 +570,25 @@ def _create_parser(parser_type: t.Type[exp.Expression], table_keys: t.List[str])
 
             if key in table_keys:
                 value = self._parse_table_parts()
+                if value and self._prev.token_type == TokenType.STRING:
+                    self.raise_error(
+                        f"'{key}' property cannot be a string value: {value}. "
+                        "Please use the identifier syntax instead, e.g. foo.bar instead of 'foo.bar'"
+                    )
             elif key == "columns":
                 value = self._parse_schema()
             elif key == "kind":
-                id_var = self._parse_id_var(any_token=True)
-                if not id_var:
-                    value = None
+                field = _parse_macro_or_clause(self, lambda: self._parse_id_var(any_token=True))
+
+                if not field or isinstance(field, (MacroVar, MacroFunc)):
+                    value = field
                 else:
-                    kind = ModelKindName[id_var.name.upper()]
+                    try:
+                        kind = ModelKindName[field.name.upper()]
+                    except KeyError:
+                        raise SQLMeshError(
+                            f"Model kind specified as '{field.name}', but that is not a valid model kind.\n\nPlease specify one of {', '.join(ModelKindName)}."
+                        )
 
                     if kind in (
                         ModelKindName.INCREMENTAL_BY_TIME_RANGE,
@@ -561,11 +605,7 @@ def _create_parser(parser_type: t.Type[exp.Expression], table_keys: t.List[str])
                     else:
                         props = None
 
-                    value = self.expression(
-                        ModelKind,
-                        this=kind.value,
-                        expressions=props,
-                    )
+                    value = self.expression(ModelKind, this=kind.value, expressions=props)
             elif key == "expression":
                 value = self._parse_conjunction()
             else:
@@ -593,15 +633,11 @@ def _props_sql(self: Generator, expressions: t.List[exp.Expression]) -> str:
     size = len(expressions)
 
     for i, prop in enumerate(expressions):
-        value = prop.args.get("value")
-        if prop.name == "when_matched" and isinstance(value, list):
-            output_value = ", ".join(self.sql(v) for v in value)
-        else:
-            output_value = self.sql(prop, "value")
-        sql = self.indent(f"{prop.name} {output_value}")
+        sql = self.indent(f"{prop.name} {self.sql(prop, 'value')}")
 
         if i < size - 1:
             sql += ","
+
         props.append(self.maybe_comment(sql, expression=prop))
 
     return "\n".join(props)
@@ -636,6 +672,15 @@ def _macro_func_sql(self: Generator, expression: MacroFunc) -> str:
     return self.maybe_comment(sql, expression)
 
 
+def _whens_sql(self: Generator, expression: exp.Whens) -> str:
+    if isinstance(expression.parent, exp.Merge):
+        return self.whens_sql(expression)
+
+    # If the `WHEN` clauses aren't part of a MERGE statement (e.g. they
+    # appear in the `MODEL` DDL), then we will wrap them with parentheses.
+    return self.wrap(self.expressions(expression, sep=" ", indent=False))
+
+
 def _override(klass: t.Type[Tokenizer | Parser], func: t.Callable) -> None:
     name = func.__name__
     setattr(klass, f"_{name}", getattr(klass, name))
@@ -662,8 +707,6 @@ def format_model_expressions(
     if len(expressions) == 1 and is_meta_expression(expressions[0]):
         return expressions[0].sql(pretty=True, dialect=dialect)
 
-    *statements, query = expressions
-
     if rewrite_casts:
 
         def cast_to_colon(node: exp.Expression) -> exp.Expression:
@@ -684,14 +727,16 @@ def format_model_expressions(
             exp.replace_children(node, cast_to_colon)
             return node
 
-        query = query.copy()
-        exp.replace_children(query, cast_to_colon)
+        new_expressions = []
+        for expression in expressions:
+            expression = expression.copy()
+            exp.replace_children(expression, cast_to_colon)
+            new_expressions.append(expression)
+
+        expressions = new_expressions
 
     return ";\n\n".join(
-        [
-            *(statement.sql(pretty=True, dialect=dialect, **kwargs) for statement in statements),
-            query.sql(pretty=True, dialect=dialect, **kwargs),
-        ]
+        expression.sql(pretty=True, dialect=dialect, **kwargs) for expression in expressions
     ).strip()
 
 
@@ -733,6 +778,8 @@ def _is_command_statement(command: str, tokens: t.List[Token], pos: int) -> bool
 JINJA_QUERY_BEGIN = "JINJA_QUERY_BEGIN"
 JINJA_STATEMENT_BEGIN = "JINJA_STATEMENT_BEGIN"
 JINJA_END = "JINJA_END"
+ON_VIRTUAL_UPDATE_BEGIN = "ON_VIRTUAL_UPDATE_BEGIN"
+ON_VIRTUAL_UPDATE_END = "ON_VIRTUAL_UPDATE_END"
 
 
 def _is_jinja_statement_begin(tokens: t.List[Token], pos: int) -> bool:
@@ -755,10 +802,24 @@ def jinja_statement(statement: str) -> JinjaStatement:
     return JinjaStatement(this=exp.Literal.string(statement.strip()))
 
 
+def _is_virtual_statement_begin(tokens: t.List[Token], pos: int) -> bool:
+    return _is_command_statement(ON_VIRTUAL_UPDATE_BEGIN, tokens, pos)
+
+
+def _is_virtual_statement_end(tokens: t.List[Token], pos: int) -> bool:
+    return _is_command_statement(ON_VIRTUAL_UPDATE_END, tokens, pos)
+
+
+def virtual_statement(statements: t.List[exp.Expression]) -> VirtualUpdateStatement:
+    return VirtualUpdateStatement(expressions=statements)
+
+
 class ChunkType(Enum):
     JINJA_QUERY = auto()
     JINJA_STATEMENT = auto()
     SQL = auto()
+    VIRTUAL_STATEMENT = auto()
+    VIRTUAL_JINJA_STATEMENT = auto()
 
 
 def parse_one(
@@ -798,9 +859,15 @@ def parse(
     total = len(tokens)
 
     pos = 0
+    virtual = False
     while pos < total:
         token = tokens[pos]
-        if _is_jinja_end(tokens, pos) or (
+        if _is_virtual_statement_end(tokens, pos):
+            chunks[-1][0].append(token)
+            virtual = False
+            chunks.append(([], ChunkType.SQL))
+            pos += 2
+        elif _is_jinja_end(tokens, pos) or (
             chunks[-1][1] == ChunkType.SQL
             and token.token_type == TokenType.SEMICOLON
             and pos < total - 1
@@ -811,13 +878,24 @@ def parse(
                 # Jinja end statement
                 chunks[-1][0].append(token)
                 pos += 2
-            chunks.append(([], ChunkType.SQL))
+            chunks.append(
+                (
+                    [],
+                    ChunkType.VIRTUAL_STATEMENT
+                    if virtual and tokens[pos] != ON_VIRTUAL_UPDATE_END
+                    else ChunkType.SQL,
+                )
+            )
         elif _is_jinja_query_begin(tokens, pos):
             chunks.append(([token], ChunkType.JINJA_QUERY))
             pos += 2
         elif _is_jinja_statement_begin(tokens, pos):
             chunks.append(([token], ChunkType.JINJA_STATEMENT))
             pos += 2
+        elif _is_virtual_statement_begin(tokens, pos):
+            chunks.append(([token], ChunkType.VIRTUAL_STATEMENT))
+            pos += 2
+            virtual = True
         else:
             chunks[-1][0].append(token)
             pos += 1
@@ -825,22 +903,68 @@ def parse(
     parser = dialect.parser()
     expressions: t.List[exp.Expression] = []
 
-    for chunk, chunk_type in chunks:
-        if chunk_type == ChunkType.SQL:
-            parsed_expressions: t.List[t.Optional[exp.Expression]] = (
-                parser.parse(chunk, sql) if into is None else parser.parse_into(into, chunk, sql)
-            )
-            for expression in parsed_expressions:
-                if expression:
+    def parse_sql_chunk(chunk: t.List[Token], meta_sql: bool = True) -> t.List[exp.Expression]:
+        parsed_expressions: t.List[t.Optional[exp.Expression]] = (
+            parser.parse(chunk, sql) if into is None else parser.parse_into(into, chunk, sql)
+        )
+        expressions = []
+        for expression in parsed_expressions:
+            if expression:
+                if meta_sql:
                     expression.meta["sql"] = parser._find_sql(chunk[0], chunk[-1])
-                    expressions.append(expression)
-        else:
-            start, *_, end = chunk
-            segment = sql[start.end + 2 : end.start - 1]
-            factory = jinja_query if chunk_type == ChunkType.JINJA_QUERY else jinja_statement
-            expression = factory(segment.strip())
+                expressions.append(expression)
+        return expressions
+
+    def parse_jinja_chunk(chunk: t.List[Token], meta_sql: bool = True) -> exp.Expression:
+        start, *_, end = chunk
+        segment = sql[start.end + 2 : end.start - 1]
+        factory = jinja_query if chunk_type == ChunkType.JINJA_QUERY else jinja_statement
+        expression = factory(segment.strip())
+        if meta_sql:
             expression.meta["sql"] = sql[start.start : end.end + 1]
-            expressions.append(expression)
+        return expression
+
+    def parse_virtual_statement(
+        chunks: t.List[t.Tuple[t.List[Token], ChunkType]], pos: int
+    ) -> t.Tuple[t.List[exp.Expression], int]:
+        # For virtual statements we need to handle both SQL and Jinja nested blocks within the chunk
+        virtual_update_statements = []
+        start = chunks[pos][0][0].start
+
+        while (
+            chunks[pos - 1][0] == [] or chunks[pos - 1][0][-1].text.upper() != ON_VIRTUAL_UPDATE_END
+        ):
+            chunk, chunk_type = chunks[pos]
+            if chunk_type == ChunkType.JINJA_STATEMENT:
+                virtual_update_statements.append(parse_jinja_chunk(chunk, False))
+            else:
+                virtual_update_statements.extend(
+                    parse_sql_chunk(
+                        chunk[int(chunk[0].text.upper() == ON_VIRTUAL_UPDATE_BEGIN) : -1], False
+                    ),
+                )
+            pos += 1
+
+        if virtual_update_statements:
+            statements = virtual_statement(virtual_update_statements)
+            end = chunk[-1].end + 1
+            statements.meta["sql"] = sql[start:end]
+            return [statements], pos
+
+        return [], pos
+
+    pos = 0
+    total_chunks = len(chunks)
+    while pos < total_chunks:
+        chunk, chunk_type = chunks[pos]
+        if chunk_type == ChunkType.VIRTUAL_STATEMENT:
+            virtual_expression, pos = parse_virtual_statement(chunks, pos)
+            expressions.extend(virtual_expression)
+        elif chunk_type == ChunkType.SQL:
+            expressions.extend(parse_sql_chunk(chunk))
+        else:
+            expressions.append(parse_jinja_chunk(chunk))
+        pos += 1
 
     return expressions
 
@@ -889,9 +1013,10 @@ def extend_sqlglot() -> None:
                     ModelKind: _model_kind_sql,
                     PythonCode: lambda self, e: self.expressions(e, sep="\n", indent=False),
                     StagedFilePath: lambda self, e: self.table_sql(e),
+                    exp.Whens: _whens_sql,
                 }
             )
-
+        if MacroDef not in generator.WITH_SEPARATED_COMMENTS:
             generator.WITH_SEPARATED_COMMENTS = (
                 *generator.WITH_SEPARATED_COMMENTS,
                 Model,
@@ -1121,10 +1246,12 @@ def transform_values(
         yield _transform_value(col_value, col_type)
 
 
-def to_schema(sql_path: str | exp.Table) -> exp.Table:
+def to_schema(sql_path: str | exp.Table, dialect: DialectType = None) -> exp.Table:
     if isinstance(sql_path, exp.Table) and sql_path.this is None:
         return sql_path
-    table = exp.to_table(sql_path.copy() if isinstance(sql_path, exp.Table) else sql_path)
+    table = exp.to_table(
+        sql_path.copy() if isinstance(sql_path, exp.Table) else sql_path, dialect=dialect
+    )
     table.set("catalog", table.args.get("db"))
     table.set("db", table.args.get("this"))
     table.set("this", None)
@@ -1191,7 +1318,9 @@ def interpret_key_value_pairs(
     return {i.this.name: interpret_expression(i.expression) for i in e.expressions}
 
 
-def extract_audit(v: exp.Expression) -> t.Tuple[str, t.Dict[str, exp.Expression]]:
+def extract_func_call(
+    v: exp.Expression, allow_tuples: bool = False
+) -> t.Tuple[str, t.Dict[str, exp.Expression]]:
     kwargs = {}
 
     if isinstance(v, exp.Anonymous):
@@ -1200,6 +1329,15 @@ def extract_audit(v: exp.Expression) -> t.Tuple[str, t.Dict[str, exp.Expression]
     elif isinstance(v, exp.Func):
         func = v.sql_name()
         args = list(v.args.values())
+    elif isinstance(v, exp.Paren):
+        func = ""
+        args = [v.this]
+    elif isinstance(v, exp.Tuple):  # airflow only
+        if not allow_tuples:
+            raise ConfigError("Audit name is missing (eg. MY_AUDIT())")
+
+        func = ""
+        args = v.expressions
     else:
         return v.name.lower(), {}
 
@@ -1214,3 +1352,19 @@ def extract_audit(v: exp.Expression) -> t.Tuple[str, t.Dict[str, exp.Expression]
 
 def is_meta_expression(v: t.Any) -> bool:
     return isinstance(v, (Audit, Metric, Model))
+
+
+def replace_merge_table_aliases(expression: exp.Expression) -> exp.Expression:
+    """
+    Resolves references from the "source" and "target" tables (or their DBT equivalents)
+    with the corresponding SQLMesh merge aliases (MERGE_SOURCE_ALIAS and MERGE_TARGET_ALIAS)
+    """
+    from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
+
+    if isinstance(expression, exp.Column):
+        if expression.table.lower() in ("target", "dbt_internal_dest", "__merge_target__"):
+            expression.set("table", exp.to_identifier(MERGE_TARGET_ALIAS))
+        elif expression.table.lower() in ("source", "dbt_internal_source", "__merge_source__"):
+            expression.set("table", exp.to_identifier(MERGE_SOURCE_ALIAS))
+
+    return expression

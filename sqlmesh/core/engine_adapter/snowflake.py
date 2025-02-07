@@ -6,13 +6,17 @@ import typing as t
 
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype  # type: ignore
-from sqlglot import exp, parse_one
-from sqlglot.helper import seq_get
+from sqlglot import exp
+from sqlglot.helper import ensure_list
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 
 from sqlmesh.core.dialect import to_schema
-from sqlmesh.core.engine_adapter.mixins import GetCurrentCatalogFromFunctionMixin, ClusteredByMixin
+from sqlmesh.core.engine_adapter.mixins import (
+    GetCurrentCatalogFromFunctionMixin,
+    ClusteredByMixin,
+    RowDiffMixin,
+)
 from sqlmesh.core.engine_adapter.shared import (
     CatalogSupport,
     DataObject,
@@ -29,16 +33,8 @@ snowpark = optional_import("snowflake.snowpark")
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, SessionProperties, TableName
-    from sqlmesh.core.engine_adapter._typing import DF, Query, SnowparkSession
+    from sqlmesh.core.engine_adapter._typing import DF, Query, QueryOrDF, SnowparkSession
     from sqlmesh.core.node import IntervalUnit
-
-
-class SnowflakeDataObject(DataObject):
-    clustering_key: t.Optional[str] = None
-
-    @property
-    def is_clustered(self) -> bool:
-        return bool(self.clustering_key)
 
 
 @set_catalog(
@@ -48,13 +44,12 @@ class SnowflakeDataObject(DataObject):
         "drop_schema": CatalogSupport.REQUIRES_SET_CATALOG,
     }
 )
-class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixin):
+class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixin, RowDiffMixin):
     DIALECT = "snowflake"
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
     SUPPORTS_CLONING = True
     SUPPORTS_MANAGED_MODELS = True
-    CATALOG_SUPPORT = CatalogSupport.FULL_SUPPORT
     CURRENT_CATALOG_EXPRESSION = exp.func("current_database")
     SCHEMA_DIFFER = SchemaDiffer(
         parameterized_type_defaults={
@@ -113,13 +108,17 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
             ).getOrCreate()
         return None
 
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        return CatalogSupport.FULL_SUPPORT
+
     def create_managed_table(
         self,
         table_name: TableName,
         query: Query,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
@@ -160,6 +159,39 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
             **kwargs,
         )
 
+    def create_view(
+        self,
+        view_name: TableName,
+        query_or_df: QueryOrDF,
+        columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        replace: bool = True,
+        materialized: bool = False,
+        materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        **create_kwargs: t.Any,
+    ) -> None:
+        properties = create_kwargs.pop("properties", None)
+        if not properties:
+            properties = exp.Properties(expressions=[])
+        if replace:
+            properties.append("expressions", exp.CopyGrantsProperty())
+
+        super().create_view(
+            view_name=view_name,
+            query_or_df=query_or_df,
+            columns_to_types=columns_to_types,
+            replace=replace,
+            materialized=materialized,
+            materialized_properties=materialized_properties,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            view_properties=view_properties,
+            properties=properties,
+            **create_kwargs,
+        )
+
     def drop_managed_table(self, table_name: TableName, exists: bool = True) -> None:
         self._drop_object(table_name, exists, kind=self.MANAGED_TABLE_KIND)
 
@@ -170,7 +202,7 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
         storage_format: t.Optional[str] = None,
         partitioned_by: t.Optional[t.List[exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[str]] = None,
+        clustered_by: t.Optional[t.List[exp.Expression]] = None,
         table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
         columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
@@ -198,12 +230,12 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
                 for prop in {"WAREHOUSE", "TARGET_LAG", "REFRESH_MODE", "INITIALIZE"}:
                     table_properties.pop(prop, None)
 
+            table_type = self._pop_creatable_type_from_properties(table_properties)
+            properties.extend(ensure_list(table_type))
+
             properties.extend(self._table_or_view_properties_to_expressions(table_properties))
 
-        if properties:
-            return exp.Properties(expressions=properties)
-
-        return None
+        return exp.Properties(expressions=properties) if properties else None
 
     def _df_to_source_queries(
         self,
@@ -348,7 +380,7 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
         if df.empty:
             return []
         return [
-            SnowflakeDataObject(
+            DataObject(
                 catalog=row.catalog,  # type: ignore
                 schema=row.schema_name,  # type: ignore
                 name=row.name,  # type: ignore
@@ -433,50 +465,3 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
                 f"Column comments for table '{table.alias_or_name}' not registered - this may be due to limited permissions.",
                 exc_info=True,
             )
-
-    def get_alter_expressions(
-        self, current_table_name: TableName, target_table_name: TableName
-    ) -> t.List[exp.Alter]:
-        schema_expressions = super().get_alter_expressions(current_table_name, target_table_name)
-        additional_expressions = []
-
-        # check for a change in clustering
-        current_table = exp.to_table(current_table_name)
-        target_table = exp.to_table(target_table_name)
-
-        current_table_info = t.cast(
-            SnowflakeDataObject,
-            seq_get(self.get_data_objects(current_table.db, {current_table.name}), 0),
-        )
-        target_table_info = t.cast(
-            SnowflakeDataObject,
-            seq_get(self.get_data_objects(target_table.db, {target_table.name}), 0),
-        )
-
-        if current_table_info and target_table_info:
-            if target_table_info.is_clustered:
-                if target_table_info.clustering_key and (
-                    current_table_info.clustering_key != target_table_info.clustering_key
-                ):
-                    # Note: If you create a table with eg `CLUSTER BY (c2, c1)` and read the info back from information_schema,
-                    # it gets returned as a string like "LINEAR(c2, c1)" which we need to parse back into a list of columns
-                    parsed_cluster_key = parse_one(
-                        target_table_info.clustering_key, dialect=self.dialect
-                    )
-                    additional_expressions.append(
-                        exp.Alter(
-                            this=current_table,
-                            kind="TABLE",
-                            actions=[exp.Cluster(expressions=parsed_cluster_key.expressions)],
-                        )
-                    )
-            elif current_table_info.is_clustered:
-                additional_expressions.append(
-                    exp.Alter(
-                        this=current_table,
-                        kind="TABLE",
-                        actions=[exp.Command(this="DROP", expression="CLUSTERING KEY")],
-                    )
-                )
-
-        return schema_expressions + additional_expressions
